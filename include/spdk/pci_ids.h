@@ -28,6 +28,9 @@ extern "C" {
 #define SPDK_PCI_VID_NUTANIX		0x4e58
 #define SPDK_PCI_VID_HUAWEI		0x19e5
 #define SPDK_PCI_VID_MICROSOFT		0x1414
+#define SPDK_PCI_VID_CESNET		0x18ec
+
+#define PCI_DEVICE_ID_CESNET_NCD        0xc020
 
 #define SPDK_PCI_CLASS_ANY_ID		0xffffff
 /**
