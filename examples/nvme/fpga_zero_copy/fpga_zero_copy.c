@@ -103,26 +103,12 @@ hello_world(struct ncd_probe_ctx *ncd_ctx)
 		rc = -1;
 		goto cleanup;
 	}
-
 	printf("SQ VADD: %p, SQ PADDR: %lx\n", qopts->sq.vaddr, qopts->sq.paddr);
-
-	if (buff_size != buff_req_size) {
-		fprintf(stderr, "ERROR: Required buffer space (%lu) and the returned size of the physical buffer (%lu) for SQ queue do not match!\n", buff_req_size, buff_size);
-		rc = -1;
-		goto cleanup;
-	}
-	qopts->sq.buffer_size = buff_size;
+	qopts->sq.buffer_size = qopts->io_queue_requests*sizeof(struct spdk_nvme_cmd);
 
 	qopts->cq.vaddr = ncd_ctx->cq_bar_vaddr;
 	qopts->cq.paddr = ncd_ctx->cq_bar_paddr;
-
-	buff_req_size = qopts->io_queue_requests*sizeof(struct spdk_nvme_cpl);
-	if (buff_req_size > ncd_ctx->cq_bar_size) {
-		fprintf(stderr, "ERROR: Required buffer space (%lu) and the returned size of the physical buffer (%lu) for CQ queue do not match!\n", buff_req_size, ncd_ctx->cq_bar_size);
-		rc = -1;
-		goto cleanup;
-	}
-	qopts->cq.buffer_size = buff_req_size;
+	qopts->cq.buffer_size = qopts->io_queue_requests*sizeof(struct spdk_nvme_cpl);
 
 	g_namespace.qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_namespace.ctrlr, qopts, sizeof (struct spdk_nvme_io_qpair_opts));
 	if (g_namespace.qpair == NULL) {
@@ -284,6 +270,18 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 		return rc;
 	}
 
+	rc = spdk_pci_device_disable_interrupts(pci_dev);
+	if (rc) {
+		fprintf(stderr, "Unable to disable interrupts\n");
+		return rc;
+	}
+
+	rc = spdk_pci_device_disable_interrupt(pci_dev);
+	if (rc) {
+		fprintf(stderr, "Unable to disable interrupt\n");
+		return rc;
+	}
+
 	return 0;
 }
 
@@ -352,12 +350,14 @@ main(int argc, char **argv)
 
 	printf("Initialization complete.\n");
 	printf("NCD PCIe device context:\n");
-	printf("CQ BAR VADDR: %lx\n", (uint64_t)ctx.cq_bar_vaddr);
+	printf("CQ BAR VADDR: %p\n", ctx.cq_bar_vaddr);
 	printf("CQ BAR PADDR: %lx\n", ctx.cq_bar_paddr);
 	printf("CQ BAR size:  %ld\n", ctx.cq_bar_size);
-	printf("DATA BAR VADDR: %lx\n", (uint64_t)ctx.data_bar_vaddr);
+	printf("DATA BAR VADDR: %p\n", ctx.data_bar_vaddr);
 	printf("DATA BAR PADDR: %lx\n", ctx.data_bar_paddr);
 	printf("DATA BAR size:  %ld\n", ctx.data_bar_size);
+
+	/* *(uint64_t *) ctx.cq_bar_vaddr = 0x1248; */
 
 	rc = hello_world(&ctx);
 exit:
