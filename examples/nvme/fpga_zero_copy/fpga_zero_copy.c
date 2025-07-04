@@ -28,6 +28,7 @@ struct ns_entry {
 } g_namespace;
 
 struct ncd_probe_ctx {
+	struct spdk_nvme_cmd *sq_vaddr;
 	void *cq_bar_vaddr;
 	uint64_t cq_bar_paddr;
 	uint64_t cq_bar_size;
@@ -35,6 +36,9 @@ struct ncd_probe_ctx {
 	uint64_t data_bar_paddr;
 	uint64_t data_bar_size;
 	struct spdk_pci_device *dev;
+	uint64_t sqtdbl_paddr;
+	uint64_t cqhdbl_paddr;
+	uint64_t dbl_mask;
 };
 
 static struct spdk_pci_id ncd_pci_driver_id[] = {
@@ -60,71 +64,72 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 }
 
 static int
-hello_world(struct ncd_probe_ctx *ncd_ctx)
+queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 {
 	int				rc = 0;
-	struct spdk_nvme_io_qpair_opts  *qopts;
-	struct spdk_nvme_cmd *sq_vaddr;
+	struct spdk_nvme_io_qpair_opts  qopts;
 	uint64_t buff_req_size;
 	uint64_t buff_size;
 
 	printf("Entered hello world...\n");
 
-	qopts = malloc(sizeof(struct spdk_nvme_io_qpair_opts));
-	if (qopts == NULL) {
-		printf("ERROR: unable to create queue options structure!");
-		return -ENOMEM;
-	}
-
-	spdk_nvme_ctrlr_get_default_io_qpair_opts(g_namespace.ctrlr, qopts, sizeof(struct spdk_nvme_io_qpair_opts));
-
-	qopts->io_queue_requests = qopts->io_queue_size;
+	spdk_nvme_ctrlr_get_default_io_qpair_opts(g_namespace.ctrlr, &qopts, sizeof(struct spdk_nvme_io_qpair_opts));
 
 	printf("Queue pair options:\n");
-	printf("IO queue size: %d\n", qopts->io_queue_size);
-	printf("IO queue requests: %d\n", qopts->io_queue_requests);
+	printf("IO queue size: %d\n", qopts.io_queue_size);
+	printf("IO queue requests: %d\n", qopts.io_queue_requests);
 
+	qopts.io_queue_requests = qopts.io_queue_size;
 
-	buff_req_size = qopts->io_queue_requests*sizeof(struct spdk_nvme_cmd);
+	buff_req_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cmd);
 	buff_size = buff_req_size;
 	// NOTE: The memory alignment needs to be aligned to the memory page size as specified in CC.MPS
 	// register of the NVMe controller
-	sq_vaddr = spdk_dma_zmalloc(buff_req_size, 0x1000, NULL);
-	if (sq_vaddr == NULL) {
+	ncd_ctx->sq_vaddr = spdk_dma_zmalloc(buff_req_size, 0x1000, NULL);
+	if (ncd_ctx->sq_vaddr == NULL) {
 		fprintf(stderr, "ERROR: Failed to alloc SQ buffer\n");
 		rc = -1;
-		goto cleanup;
+		goto sq_alloc_fail;
 	}
 
-	qopts->sq.vaddr = sq_vaddr;
-	qopts->sq.paddr = spdk_vtophys(sq_vaddr, &buff_size);
-	if (qopts->sq.paddr == SPDK_VTOPHYS_ERROR) {
+	qopts.sq.vaddr = ncd_ctx->sq_vaddr;
+	qopts.sq.paddr = spdk_vtophys(ncd_ctx->sq_vaddr, &buff_size);
+	if (qopts.sq.paddr == SPDK_VTOPHYS_ERROR) {
 		fprintf(stderr, "ERROR: Unable to return physical address of an underlying buffer.");
 		rc = -1;
-		goto cleanup;
+		goto vtophys_fail;
 	}
-	printf("SQ VADD: %p, SQ PADDR: %lx\n", qopts->sq.vaddr, qopts->sq.paddr);
-	qopts->sq.buffer_size = qopts->io_queue_requests*sizeof(struct spdk_nvme_cmd);
+	printf("SQ VADD: %p, SQ PADDR: %lx\n", qopts.sq.vaddr, qopts.sq.paddr);
+	qopts.sq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cmd);
 
-	qopts->cq.vaddr = ncd_ctx->cq_bar_vaddr;
-	qopts->cq.paddr = ncd_ctx->cq_bar_paddr;
-	qopts->cq.buffer_size = qopts->io_queue_requests*sizeof(struct spdk_nvme_cpl);
+	qopts.cq.vaddr = ncd_ctx->cq_bar_vaddr;
+	qopts.cq.paddr = ncd_ctx->cq_bar_paddr;
+	qopts.cq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cpl);
 
-	g_namespace.qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_namespace.ctrlr, qopts, sizeof (struct spdk_nvme_io_qpair_opts));
+	g_namespace.qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_namespace.ctrlr, &qopts, sizeof (struct spdk_nvme_io_qpair_opts));
 	if (g_namespace.qpair == NULL) {
 		printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair() failed\n");
 		rc = -1;
-		goto cleanup;
+		goto vtophys_fail;
 	}
 	printf("Successfully allocated Queue pair!\n");
 
+	return rc;
+
+vtophys_fail:
+	spdk_dma_free(ncd_ctx->sq_vaddr);
+sq_alloc_fail:
+	return -1;
+}
+
+static void
+queues_dealloc(struct ncd_probe_ctx *ncd_ctx)
+{
+
 	spdk_nvme_ctrlr_free_io_qpair(g_namespace.qpair);
 	printf("Successfully freed Queue pair!\n");
-
-cleanup:
-	spdk_dma_free(sq_vaddr);
-	spdk_free(qopts);
-	return rc;
+	spdk_dma_free(ncd_ctx->sq_vaddr);
+	printf("Successfully freed sq_vaddr!\n");
 }
 
 static bool
@@ -144,6 +149,17 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	struct spdk_nvme_ns *ns;
 	const struct spdk_nvme_ctrlr_data *cdata;
 	const struct spdk_nvme_ctrlr_opts *copts;
+	struct spdk_pci_device *pci_dev;
+	struct spdk_pci_addr pci_addr;
+	char bdf[32];
+	char sysfs_path[128];
+	uint64_t bar_start, bar_end, bar_flags;
+	FILE *fp;
+	volatile struct spdk_nvme_registers *regs;
+	uint32_t stride;
+	uint32_t qid = 1;
+	uint64_t doorbell_base;
+	struct ncd_probe_ctx *probe_ctx = cb_ctx;
 
 	printf("Attaching to %s ...\n", trid->traddr);
 
@@ -164,7 +180,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);
 	ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
 	if (ns == NULL) {
-		printf("ERROR: Invalid namespace!\n");
+		fprintf(stderr, "ERROR: Invalid namespace!\n");
 		return;
 	}
 	register_ns(ctrlr, ns);
@@ -172,13 +188,54 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("Controller options:\n");
 	copts = spdk_nvme_ctrlr_get_opts(ctrlr);
 	if (copts == NULL) {
-		printf("No controller options found!");
+		fprintf(stderr, "No controller options found!");
 		return;
 	}
 
 	printf("\tNumber of IO queues: %d\n", copts->num_io_queues);
 	printf("\tSize of IO queues:   %d\n", copts->io_queue_size);
 	printf("\tIO queue requests:   %d\n", copts->io_queue_requests);
+
+	pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
+	if (!pci_dev) {
+		fprintf(stderr, "Device is not PCI-backed, can't retrieve BDF.\n");
+		return;
+	}
+	pci_addr = spdk_pci_device_get_addr(pci_dev);
+
+	snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.%x", pci_addr.domain, pci_addr.bus, pci_addr.dev, pci_addr.func);
+
+	// Construct sysfs path for BAR0
+	snprintf(sysfs_path, sizeof(sysfs_path), "/sys/bus/pci/devices/%s/resource", bdf);
+
+	// Read the resource file
+	fp = fopen(sysfs_path, "r");
+	if (!fp) {
+		fprintf(stderr, "Failed to open resource file %s\n", sysfs_path);
+		return;
+	}
+
+	if (fscanf(fp, "%lx %lx %lx", &bar_start, &bar_end, &bar_flags) != 3) {
+		fprintf(stderr, "Failed to parse resource file\n");
+		fclose(fp);
+		return;
+	}
+
+	fclose(fp);
+
+	printf("Physical address of NVME BAR0: 0x%lx\n", bar_start);
+
+	regs = spdk_nvme_ctrlr_get_registers(ctrlr);
+	stride = 4 << regs->cap.bits.dstrd;
+	// Doorbell registers start at offset 0x1000 from BAR0
+	doorbell_base = bar_start + 0x1000;
+
+	probe_ctx->sqtdbl_paddr = doorbell_base + (2 * qid) * stride;
+	probe_ctx->cqhdbl_paddr = doorbell_base + (2 * qid + 1) * stride;
+
+	/* printf("Queue ID: %u, DSTRD: %u, stride: %u\n", qid, regs->cap.bits.dstrd, stride); */
+	/* printf("SQTDBL physical address: 0x%lx\n", sqtdbl_phys); */
+	/* printf("CQHDBL physical address: 0x%lx\n", cqhdbl_phys); */
 }
 
 static void
@@ -311,7 +368,7 @@ main(int argc, char **argv)
 	printf("Initializing NVMe Controller\n");
 
 	//spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
-	rc = spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL);
+	rc = spdk_nvme_probe(NULL, &ctx, probe_cb, attach_cb, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "ERROR: spdk_nvme_probe() failed\n");
 		return 1;
@@ -356,13 +413,20 @@ main(int argc, char **argv)
 	printf("DATA BAR VADDR: %p\n", ctx.data_bar_vaddr);
 	printf("DATA BAR PADDR: %lx\n", ctx.data_bar_paddr);
 	printf("DATA BAR size:  %ld\n", ctx.data_bar_size);
+	printf("SQTDBL physical address: 0x%lx\n", ctx.sqtdbl_paddr);
+	printf("CQHDBL physical address: 0x%lx\n", ctx.cqhdbl_paddr);
 
-	/* *(uint64_t *) ctx.cq_bar_vaddr = 0x1248; */
+	*(uint64_t *) ctx.cq_bar_vaddr = 0x1248;
 
-	rc = hello_world(&ctx);
+	rc = queues_alloc(&ctx);
 exit:
+	queues_dealloc(&ctx);
+	printf("Qeues dealloced\n");
 	spdk_pci_device_detach(ctx.dev);
+	printf("Pcie dev detached\n");
 	fflush(stdout);
+	printf("Stdout flushed\n");
 	spdk_env_fini();
+	printf("Env finished\n");
 	return rc;
 }
