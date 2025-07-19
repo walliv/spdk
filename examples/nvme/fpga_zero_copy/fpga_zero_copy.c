@@ -753,7 +753,10 @@ main(int argc, char **argv)
 		goto dma_ctrl_alloc_fail;
 	}
 
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 1);
+	// Can be commented out if we want to keep statistics between runs
+	nfb_comp_write8(dma_ctx.comp, REG_SQES_DISPATCHED, 0);
+	usleep(1);
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0);
 	printf("NCD command written\n");
 
 	usleep(1000);
