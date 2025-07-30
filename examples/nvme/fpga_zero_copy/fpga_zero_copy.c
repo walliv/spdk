@@ -740,11 +740,11 @@ main(int argc, char **argv)
 
 	/* Read test string from NVMe and write it to the FPGA */
 	/* for (int it = 0; it < 1000; it++) { */
-	rc = submit_rw_request(1, g_namespace.sw_qpair, ctx.data_bar_vaddr);
-	if (rc) {
-		fprintf(stderr, "ERROR: Failed to submit RW request!\n");
-		goto buf_alloc_fail;
-	}
+	/* rc = submit_rw_request(1, g_namespace.sw_qpair, ctx.data_bar_vaddr); */
+	/* if (rc) { */
+	/* 	fprintf(stderr, "ERROR: Failed to submit RW request!\n"); */
+	/* 	goto buf_alloc_fail; */
+	/* } */
 	/* } */
 
 	rc = dma_ctrl_init(&ctx, &dma_ctx);
