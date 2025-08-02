@@ -42,6 +42,7 @@
 #define REG_RECV_PCIE_WRS_BYTES 0x84
 #define REG_PROC_RDS            0x8C
 #define REG_PROC_RDS_BYTES      0x94
+#define REG_LBA_MASK            0x9C
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr	*ctrlr;
@@ -87,6 +88,7 @@ struct ncd_probe_ctx {
 	uint64_t sq_paddr;
 	uint64_t sqtdbl_paddr;
 	uint64_t cqhdbl_paddr;
+	uint16_t lba_mask;
 };
 
 static struct spdk_pci_id ncd_pci_driver_id[] = {
@@ -363,8 +365,9 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	char sysfs_path[128];
 	uint64_t bar_start, bar_end, bar_flags;
 	FILE *fp;
-	volatile struct spdk_nvme_registers *regs;
+	union spdk_nvme_cap_register cap;
 	struct ncd_probe_ctx *probe_ctx = cb_ctx;
+	uint32_t sect_size;
 
 	printf("Attaching to %s ...\n", trid->traddr);
 
@@ -377,6 +380,8 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 *  specification for more details on IDENTIFY for NVMe controllers.
 	 */
 	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
+	// Retrieve capability registers
+	cap = spdk_nvme_ctrlr_get_regs_cap(ctrlr);
 
 	snprintf(g_controller.name, sizeof(g_controller.name), "%-20.20s (%-20.20s)", cdata->mn, cdata->sn);
 
@@ -395,9 +400,14 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	g_namespace.ctrlr = ctrlr;
 	g_namespace.ns = ns;
+	sect_size = spdk_nvme_ns_get_sector_size(ns);
 
-	printf("  Namespace ID: %d size: %juGB\n", nsid,
-	       spdk_nvme_ns_get_size(ns) / 1000000000);
+	// Unlimited Max Data transfer size
+	if (cdata->mdts == 0) {
+		probe_ctx->lba_mask = 0xFFFF;
+	} else {
+		probe_ctx->lba_mask = (uint16_t)((1 << (12 + cap.bits.mpsmin + cdata->mdts)) / sect_size) - 1;
+	}
 
 	printf("Controller options:\n");
 	copts = spdk_nvme_ctrlr_get_opts(ctrlr);
@@ -406,9 +416,13 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		return;
 	}
 
-	printf("\tNumber of IO queues: %d\n", copts->num_io_queues);
-	printf("\tSize of IO queues:   %d\n", copts->io_queue_size);
-	printf("\tIO queue requests:   %d\n", copts->io_queue_requests);
+	printf("\tNumber of IO queues:   %d\n", copts->num_io_queues);
+	printf("\tSize of IO queues:     %d\n", copts->io_queue_size);
+	printf("\tIO queue requests:     %d\n", copts->io_queue_requests);
+	printf("\tNS %d size:             %juGB\n", nsid, spdk_nvme_ns_get_size(ns) / 1000000000);
+	printf("\tNS number of sectors:  %ld\n", spdk_nvme_ns_get_num_sectors(ns));
+	printf("\tNS sector size:        %dB\n", sect_size);
+	printf("\tLBA Mask:              %x\n", probe_ctx->lba_mask);
 
 	pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
 	if (!pci_dev) {
@@ -439,11 +453,9 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	printf("Physical address of NVME BAR0: 0x%lx\n", bar_start);
 
-	regs = spdk_nvme_ctrlr_get_registers(ctrlr);
-
 	// Doorbell registers start at offset 0x1000 from BAR0 but they start from the Admin Queues!
 	probe_ctx->doorbell_base = bar_start + 0x1000;
-	probe_ctx->doorbell_stride = regs->cap.bits.dstrd;
+	probe_ctx->doorbell_stride = cap.bits.dstrd;
 	printf("Doorbell stride: %d\n", probe_ctx->doorbell_stride);
 	probe_ctx->nsid = nsid;
 }
@@ -452,6 +464,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 {
 	int rc = 0;
 	int node;
+	struct nfb_comp *dlogger;
 
 	dma_ctx->dev = nfb_open("/dev/nfb/by-pci-slot/0000:61:00.0");
 	if(!dma_ctx->dev) {
@@ -463,26 +476,39 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	node = nfb_comp_find(dma_ctx->dev, "ziti,dma_iuventus", 0);
 	dma_ctx->comp = nfb_comp_open(dma_ctx->dev, node);
 	if (dma_ctx->comp == NULL) {
-		fprintf(stderr, "ERROR: Failed to open NFB component");
+		fprintf(stderr, "ERROR: Failed to open DMA control registers as nfb_comp");
 		rc = -2;
-		goto comp_open_fail;
+		goto dma_open_fail;
+	}
+
+	node = nfb_comp_find(dma_ctx->dev, "ziti,dma_iops_meter", 0);
+	dlogger = nfb_comp_open(dma_ctx->dev, node);
+	if (dlogger == NULL) {
+		fprintf(stderr, "ERROR: Failed to open Data Logger as nfb_comp");
+		rc = -3;
+		goto dlogger_open_fail;
 	}
 
 	// Send a reset and wait until its done
-	nfb_comp_write8(dma_ctx->comp, REG_CONTROL, 2);
-	while(!(nfb_comp_read8(dma_ctx->comp, REG_STATUS) & 2));
+	nfb_comp_write8(dlogger, 0, 1);
+	while(!(nfb_comp_read8(dlogger, 0) & 2));
 	printf("Reset of the Command Dispatcher done!\n");
+
+	nfb_comp_close(dlogger);
 
 	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, ncd_ctx->dbl_mask);
 	nfb_comp_write64(dma_ctx->comp, REG_SQ_BASE_ADDR, ncd_ctx->sq_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BASE_ADDR, ncd_ctx->sqtdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BASE_ADDR, ncd_ctx->cqhdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_1_ADDR, ncd_ctx->data_bar_paddr);
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_AMOUNT, 0);
+	nfb_comp_write16(dma_ctx->comp, REG_LBA_AMOUNT, 0x0003);
+	nfb_comp_write16(dma_ctx->comp, REG_LBA_MASK, ncd_ctx->lba_mask);
 
 	return 0;
 
-comp_open_fail:
+dlogger_open_fail:
+	nfb_comp_close(dma_ctx->comp);
+dma_open_fail:
 	nfb_close(dma_ctx->dev);
 dev_open_fail:
 	return rc;
@@ -490,7 +516,6 @@ dev_open_fail:
 
 static void dma_ctrl_close(struct dma_ctrl_ctx *dma_ctx)
 {
-
 	nfb_comp_close(dma_ctx->comp);
 	nfb_close(dma_ctx->dev);
 }
@@ -591,12 +616,12 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 		return rc;
 	}
 
-	printf("CQ BAR VADDR: %p\n", probe_ctx->cq_bar_vaddr);
-	printf("CQ BAR PADDR: %lx\n", probe_ctx->cq_bar_paddr);
-	printf("CQ BAR size:  %ld\n", probe_ctx->cq_bar_size);
-	printf("DATA BAR VADDR: %p\n", probe_ctx->data_bar_vaddr);
-	printf("DATA BAR PADDR: %lx\n", probe_ctx->data_bar_paddr);
-	printf("DATA BAR size:  %ld\n", probe_ctx->data_bar_size);
+	/* printf("CQ BAR VADDR: %p\n", probe_ctx->cq_bar_vaddr); */
+	/* printf("CQ BAR PADDR: %lx\n", probe_ctx->cq_bar_paddr); */
+	/* printf("CQ BAR size:  %ld\n", probe_ctx->cq_bar_size); */
+	/* printf("DATA BAR VADDR: %p\n", probe_ctx->data_bar_vaddr); */
+	/* printf("DATA BAR PADDR: %lx\n", probe_ctx->data_bar_paddr); */
+	/* printf("DATA BAR size:  %ld\n", probe_ctx->data_bar_size); */
 
 	mem_register_start = _2MB_PAGE((uintptr_t)probe_ctx->cq_bar_vaddr);
 	mem_register_end = CEIL_2MB((uintptr_t)probe_ctx->cq_bar_vaddr + probe_ctx->cq_bar_size);
@@ -705,12 +730,12 @@ main(int argc, char **argv)
 
 	printf("PCIE domain initialization complete\n");
 	printf("NCD PCIe device context:\n");
-	printf("CQ BAR VADDR: %p\n", ctx.cq_bar_vaddr);
-	printf("CQ BAR PADDR: %lx\n", ctx.cq_bar_paddr);
-	printf("CQ BAR size:  %ld\n", ctx.cq_bar_size);
-	printf("DATA BAR VADDR: %p\n", ctx.data_bar_vaddr);
-	printf("DATA BAR PADDR: %lx\n", ctx.data_bar_paddr);
-	printf("DATA BAR size:  %ld\n", ctx.data_bar_size);
+	printf("\tCQ BAR VADDR: %p\n", ctx.cq_bar_vaddr);
+	printf("\tCQ BAR PADDR: %lx\n", ctx.cq_bar_paddr);
+	printf("\tCQ BAR size:  %ld\n", ctx.cq_bar_size);
+	printf("\tDATA BAR VADDR: %p\n", ctx.data_bar_vaddr);
+	printf("\tDATA BAR PADDR: %lx\n", ctx.data_bar_paddr);
+	printf("\tDATA BAR size:  %ld\n", ctx.data_bar_size);
 	/* *(uint64_t *) ctx.cq_bar_vaddr = 0x1248; */
 
 	rc = queues_alloc(&ctx);
@@ -718,25 +743,24 @@ main(int argc, char **argv)
 		fprintf(stderr, "Unable to allocate queues!\n");
 		goto queue_alloc_fail;
 	}
+	printf("\tSQTDBL physical address: 0x%lx\n", ctx.sqtdbl_paddr);
+	printf("\tCQHDBL physical address: 0x%lx\n", ctx.cqhdbl_paddr);
 	printf("Queues allocated.\n");
 
-	printf("SQTDBL physical address: 0x%lx\n", ctx.sqtdbl_paddr);
-	printf("CQHDBL physical address: 0x%lx\n", ctx.cqhdbl_paddr);
+	/* buf = spdk_dma_zmalloc(0x1000, 0x1000, NULL); */
+	/* if (buf == NULL) { */
+	/* 	fprintf(stderr, "ERROR: write buffer allocation failed\n"); */
+	/* 	goto buf_alloc_fail; */
+	/* } */
 
-	buf = spdk_dma_zmalloc(0x1000, 0x1000, NULL);
-	if (buf == NULL) {
-		fprintf(stderr, "ERROR: write buffer allocation failed\n");
-		goto buf_alloc_fail;
-	}
-
-	snprintf(buf, 0x1000, "%s", DATA_BUFFER_STRING);
+	/* snprintf(buf, 0x1000, "%s", DATA_BUFFER_STRING); */
 
 	// Write test string to the NVMe
-	rc = submit_rw_request(0, g_namespace.sw_qpair, buf);
-	if (rc) {
-		fprintf(stderr, "ERROR: Failed to submit RW request!\n");
-		goto buf_alloc_fail;
-	}
+	/* rc = submit_rw_request(0, g_namespace.sw_qpair, buf); */
+	/* if (rc) { */
+	/* 	fprintf(stderr, "ERROR: Failed to submit RW request!\n"); */
+	/* 	goto buf_alloc_fail; */
+	/* } */
 
 	/* Read test string from NVMe and write it to the FPGA */
 	/* for (int it = 0; it < 1000; it++) { */
@@ -754,9 +778,9 @@ main(int argc, char **argv)
 	}
 
 	// Can be commented out if we want to keep statistics between runs
-	nfb_comp_write8(dma_ctx.comp, REG_SQES_DISPATCHED, 0);
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x24);
 	usleep(1);
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0);
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x7);
 	printf("NCD command written\n");
 
 	usleep(1000);
@@ -767,7 +791,7 @@ main(int argc, char **argv)
 
 	dma_ctrl_close(&dma_ctx);
 
-buf_alloc_fail:
+/* buf_alloc_fail: */
 dma_ctrl_alloc_fail:
 	queues_dealloc(&ctx);
 	printf("Qeues dealloced\n");
