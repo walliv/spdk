@@ -90,6 +90,7 @@ struct ncd_probe_ctx {
 	uint64_t sqtdbl_paddr;
 	uint64_t cqhdbl_paddr;
 	uint16_t lba_mask;
+	uint16_t lba_num;
 };
 
 static struct spdk_pci_id ncd_pci_driver_id[] = {
@@ -470,6 +471,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	int rc = 0;
 	int node;
 	struct nfb_comp *dlogger;
+	uint16_t chosen_lba_num;
 
 	dma_ctx->dev = nfb_open("/dev/nfb/by-pci-slot/0000:61:00.0");
 	if(!dma_ctx->dev) {
@@ -506,7 +508,12 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BASE_ADDR, ncd_ctx->sqtdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BASE_ADDR, ncd_ctx->cqhdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_1_ADDR, ncd_ctx->data_bar_paddr);
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_AMOUNT, 0x0000);
+	if (ncd_ctx->lba_num > ncd_ctx->lba_mask)
+		chosen_lba_num = ncd_ctx->lba_mask;
+	else
+		chosen_lba_num = ncd_ctx->lba_num;
+	nfb_comp_write16(dma_ctx->comp, REG_LBA_AMOUNT, chosen_lba_num);
+	nfb_comp_write16(dma_ctx->comp, REG_LBA_MASK, ncd_ctx->lba_mask);
 
 	return 0;
 
@@ -538,7 +545,7 @@ usage(const char *program_name)
 #else
 	printf("\t[-L enable debug logging (flag disabled, must reconfigure with --enable-debug)]\n");
 #endif
-	printf("\t-r <fmt> Transport ID for local PCIe NVMe\n");
+	printf("\t[-t <fmt> Transport ID for local PCIe NVMe]\n");
 	printf("\t\t Format: 'key:value [key:value] ...'\n");
 	printf("\t\t Keys:\n");
 	printf("\t\t  trtype      Transport type (e.g. PCIe, RDMA)\n");
@@ -548,19 +555,27 @@ usage(const char *program_name)
 	printf("\t\t  subnqn      Subsystem NQN (default: %s)\n", SPDK_NVMF_DISCOVERY_NQN);
 	printf("\t\t  ns          NVMe namespace ID (all active namespaces are used by default)\n");
 	printf("\t\t  hostnqn     Host NQN\n");
-	printf("\t\t Example: -r 'trtype:PCIe traddr:0000:04:00.0' for PCIe\n");
+	printf("\t\t Example: -t 'trtype:PCIe traddr:0000:04:00.0' for PCIe\n");
 	printf("\t\t Note: Currently, only PCIe transfer are supported for one device only\n");
+	printf("\t[-s the amount of LBAs to copy]\n");
 }
 
 bool ctrl_rst_done = true;
 
 static int
-parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct spdk_nvme_transport_id *trid)
+parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_probe_ctx *ctx)
 {
 	int op, rc;
 
-	while ((op = getopt(argc, argv, "i:gd:L:hrt:")) != -1) {
+	while ((op = getopt(argc, argv, "s:i:gd:L:hrt:")) != -1) {
 		switch (op) {
+		case 's':
+			ctx->lba_num = spdk_strtol(optarg, 10);
+			/* if (ctx->lba_num < 0) { */
+			/* 	fprintf(stderr, "Invalid amount of LBAs, assigning to 0 ...\n"); */
+			/* 	ctx->lba_num = 0; */
+			/* } */
+			break;
 		case 'i':
 			env_opts->shm_id = spdk_strtol(optarg, 10);
 			if (env_opts->shm_id < 0) {
@@ -590,7 +605,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct spdk_nv
 #endif
 			break;
 		case 't':
-			if (spdk_nvme_transport_id_parse(trid, optarg) != 0) {
+			if (spdk_nvme_transport_id_parse(ctx->trid, optarg) != 0) {
 				fprintf(stderr, "Invalid transport ID format '%s'\n", optarg);
 				usage(argv[0]);
 				return -1;
@@ -697,9 +712,11 @@ main(int argc, char **argv)
 	char *buf = NULL;
 
 	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
+	ctx.trid = &trid;
+
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
-	rc = parse_args(argc, argv, &opts, &trid);
+	rc = parse_args(argc, argv, &opts, &ctx);
 	if (rc != 0) {
 		return rc;
 	}
@@ -711,7 +728,6 @@ main(int argc, char **argv)
 	}
 
 	printf("Initializing NVMe Controller for device %s\n", trid.traddr);
-	ctx.trid = &trid;
 	rc = spdk_nvme_probe(NULL, &ctx, probe_cb, attach_cb, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "ERROR: spdk_nvme_probe() failed\n");
@@ -810,7 +826,7 @@ main(int argc, char **argv)
 	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x24);
 	usleep(1);
 	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x3);
-	printf("NCD command written\n");
+	printf("NCD command written (READ of %u LBAs)\n", ctx.lba_num);
 
 	usleep(1000);
 	spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_vaddr);
