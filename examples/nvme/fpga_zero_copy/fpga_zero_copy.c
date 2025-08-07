@@ -69,6 +69,7 @@ struct qop_cpl_ctx {
 };
 
 struct ncd_probe_ctx {
+	struct spdk_nvme_transport_id *trid;
 	uint32_t nsid;
 	struct spdk_pci_device *dev;
 	struct spdk_nvme_cmd *sq_vaddr;
@@ -345,10 +346,14 @@ static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
 {
+	struct ncd_probe_ctx *probe_ctx = cb_ctx;
+
 	printf("Probing %s ...\n", trid->traddr);
 
-	// Accepts all controllers that it finds
-	return true;
+	if (!strcmp(trid->traddr, probe_ctx->trid->traddr))
+		return true;
+
+	return false;
 }
 
 static void
@@ -501,8 +506,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BASE_ADDR, ncd_ctx->sqtdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BASE_ADDR, ncd_ctx->cqhdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_1_ADDR, ncd_ctx->data_bar_paddr);
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_AMOUNT, 0x0003);
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_MASK, ncd_ctx->lba_mask);
+	nfb_comp_write16(dma_ctx->comp, REG_LBA_AMOUNT, 0x0000);
 
 	return 0;
 
@@ -534,16 +538,28 @@ usage(const char *program_name)
 #else
 	printf("\t[-L enable debug logging (flag disabled, must reconfigure with --enable-debug)]\n");
 #endif
+	printf("\t-r <fmt> Transport ID for local PCIe NVMe\n");
+	printf("\t\t Format: 'key:value [key:value] ...'\n");
+	printf("\t\t Keys:\n");
+	printf("\t\t  trtype      Transport type (e.g. PCIe, RDMA)\n");
+	printf("\t\t  adrfam      Address family (e.g. IPv4, IPv6)\n");
+	printf("\t\t  traddr      Transport address (e.g. 0000:04:00.0 for PCIe or 192.168.100.8 for RDMA)\n");
+	printf("\t\t  trsvcid     Transport service identifier (e.g. 4420)\n");
+	printf("\t\t  subnqn      Subsystem NQN (default: %s)\n", SPDK_NVMF_DISCOVERY_NQN);
+	printf("\t\t  ns          NVMe namespace ID (all active namespaces are used by default)\n");
+	printf("\t\t  hostnqn     Host NQN\n");
+	printf("\t\t Example: -r 'trtype:PCIe traddr:0000:04:00.0' for PCIe\n");
+	printf("\t\t Note: Currently, only PCIe transfer are supported for one device only\n");
 }
 
 bool ctrl_rst_done = true;
 
 static int
-parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
+parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct spdk_nvme_transport_id *trid)
 {
 	int op, rc;
 
-	while ((op = getopt(argc, argv, "i:gd:L:hr")) != -1) {
+	while ((op = getopt(argc, argv, "i:gd:L:hrt:")) != -1) {
 		switch (op) {
 		case 'i':
 			env_opts->shm_id = spdk_strtol(optarg, 10);
@@ -573,6 +589,13 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			spdk_log_set_print_level(SPDK_LOG_DEBUG);
 #endif
 			break;
+		case 't':
+			if (spdk_nvme_transport_id_parse(trid, optarg) != 0) {
+				fprintf(stderr, "Invalid transport ID format '%s'\n", optarg);
+				usage(argv[0]);
+				return -1;
+			}
+			break;
 		case 'h':
 			usage(argv[0]);
 			exit(EXIT_SUCCESS);
@@ -593,7 +616,8 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	int rc;
 	uint16_t cmd_reg;
 	struct ncd_probe_ctx *probe_ctx = ctx;
-	uint64_t mem_register_start, mem_register_end;
+	uint64_t mem_register_start;
+		/* mem_register_end; */
 
 	probe_ctx->dev = pci_dev;
 
@@ -623,24 +647,26 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	/* printf("DATA BAR PADDR: %lx\n", probe_ctx->data_bar_paddr); */
 	/* printf("DATA BAR size:  %ld\n", probe_ctx->data_bar_size); */
 
-	mem_register_start = _2MB_PAGE((uintptr_t)probe_ctx->cq_bar_vaddr);
-	mem_register_end = CEIL_2MB((uintptr_t)probe_ctx->cq_bar_vaddr + probe_ctx->cq_bar_size);
+	/* mem_register_start = _2MB_PAGE((uintptr_t)probe_ctx->cq_bar_vaddr); */
+	/* /\* mem_register_end = CEIL_2MB((uintptr_t)probe_ctx->cq_bar_vaddr + probe_ctx->cq_bar_size); *\/ */
+	/* assert(mem_register_start == (uintptr_t)probe_ctx->cq_bar_vaddr); */
 
-	rc = spdk_mem_register((void *)mem_register_start, VALUE_2MB);
-	if (rc) {
-		SPDK_ERRLOG("spdk_mem_register() of CQ BAR failed\n");
-		return rc;
-	}
+	/* rc = spdk_mem_register((void *)mem_register_start, VALUE_2MB); */
+	/* if (rc) { */
+	/* 	SPDK_ERRLOG("spdk_mem_register() of CQ BAR failed\n"); */
+	/* 	return rc; */
+	/* } */
 
-	mem_register_start = _2MB_PAGE((uintptr_t)probe_ctx->data_bar_vaddr);
-	mem_register_end = CEIL_2MB((uintptr_t)probe_ctx->data_bar_vaddr + probe_ctx->data_bar_size);
+	/* mem_register_start = _2MB_PAGE((uintptr_t)probe_ctx->data_bar_vaddr); */
+	/* /\* mem_register_end = CEIL_2MB((uintptr_t)probe_ctx->data_bar_vaddr + probe_ctx->data_bar_size); *\/ */
+	/* assert(mem_register_start == (uintptr_t)probe_ctx->data_bar_vaddr); */
 
-	rc = spdk_mem_register((void *)mem_register_start, VALUE_2MB);
-	if (rc) {
-		SPDK_ERRLOG("spdk_mem_register() of DATA failed\n");
-		rc = spdk_mem_unregister(probe_ctx->cq_bar_vaddr, VALUE_2MB);
-		return rc;
-	}
+	/* rc = spdk_mem_register((void *)mem_register_start, VALUE_2MB); */
+	/* if (rc) { */
+	/* 	SPDK_ERRLOG("spdk_mem_register() of DATA failed\n"); */
+	/* 	rc = spdk_mem_unregister(probe_ctx->cq_bar_vaddr, VALUE_2MB); */
+	/* 	return rc; */
+	/* } */
 
 	/* rc = spdk_pci_device_disable_interrupts(pci_dev); */
 	/* if (rc) { */
@@ -663,15 +689,17 @@ main(int argc, char **argv)
 	int rc;
 	struct spdk_env_opts opts;
 	struct spdk_pci_driver *ncd_driver;
+	struct spdk_nvme_transport_id trid = {0};
 	struct spdk_pci_addr pcie_addr;
 	struct ncd_probe_ctx ctx = {0};
 	struct dma_ctrl_ctx dma_ctx = {0};
 
 	char *buf = NULL;
 
+	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
-	rc = parse_args(argc, argv, &opts);
+	rc = parse_args(argc, argv, &opts, &trid);
 	if (rc != 0) {
 		return rc;
 	}
@@ -682,7 +710,8 @@ main(int argc, char **argv)
 		return -1;
 	}
 
-	printf("Initializing NVMe Controller\n");
+	printf("Initializing NVMe Controller for device %s\n", trid.traddr);
+	ctx.trid = &trid;
 	rc = spdk_nvme_probe(NULL, &ctx, probe_cb, attach_cb, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "ERROR: spdk_nvme_probe() failed\n");
@@ -690,7 +719,7 @@ main(int argc, char **argv)
 	}
 
 	if (g_controller.ctrlr == NULL) {
-		fprintf(stderr, "ERROR: ctrlr structure invalid!\n");
+		fprintf(stderr, "ERROR: ctrlr structure uninitialized! Specify the PCIe address.\n");
 		rc = -10;
 		goto nvme_probe_fail;
 	}
@@ -780,7 +809,7 @@ main(int argc, char **argv)
 	// Can be commented out if we want to keep statistics between runs
 	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x24);
 	usleep(1);
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x7);
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x3);
 	printf("NCD command written\n");
 
 	usleep(1000);
@@ -796,8 +825,8 @@ dma_ctrl_alloc_fail:
 	queues_dealloc(&ctx);
 	printf("Qeues dealloced\n");
 queue_alloc_fail:
-	spdk_mem_unregister(ctx.data_bar_vaddr, VALUE_2MB);
-	spdk_mem_unregister(ctx.cq_bar_vaddr, VALUE_2MB);
+	/* spdk_mem_unregister(ctx.data_bar_vaddr, VALUE_2MB); */
+	/* spdk_mem_unregister(ctx.cq_bar_vaddr, VALUE_2MB); */
 	spdk_pci_device_detach(ctx.dev);
 	printf("Pcie dev detached\n");
 	/* fflush(stdout); */
