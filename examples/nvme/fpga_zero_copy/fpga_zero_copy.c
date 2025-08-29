@@ -5,6 +5,11 @@
  *   Copyright (C) Vladislav Válek
  */
 
+#include <sys/queue.h>
+
+#include <signal.h>
+#include <nfb/nfb.h>
+
 #include "spdk/stdinc.h"
 
 #include "spdk/nvme.h"
@@ -13,9 +18,6 @@
 #include "spdk/string.h"
 #include "spdk/log.h"
 #include "spdk/memory.h"
-#include <sys/queue.h>
-
-#include <nfb/nfb.h>
 
 #define DATA_BUFFER_STRING "Dan Kriz je best!"
 
@@ -93,6 +95,15 @@ struct ncd_probe_ctx {
 	uint16_t lba_num;
 };
 
+volatile int stop = 0;
+
+static void sig_usr(int signo)
+{
+	if (signo == SIGINT || signo == SIGTERM) {
+		stop = 1;
+	}
+}
+
 static struct spdk_pci_id ncd_pci_driver_id[] = {
 	{
 		SPDK_PCI_DEVICE(0x18ec, 0xc020)
@@ -138,14 +149,6 @@ submit_admin_request(struct spdk_nvme_cmd* cmd, char *cmd_name)
 
 	return 0;
 }
-
-/* int spdk_nvme_ns_cmd_read(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, void *payload, */
-/* 			  uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn, */
-/* 			  void *cb_arg, uint32_t io_flags); */
-
-/* int spdk_nvme_ns_cmd_write(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, void *payload, */
-/* 			   uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn, */
-/* 			   void *cb_arg, uint32_t io_flags); */
 
 static int
 submit_rw_request(uint8_t rw, struct spdk_nvme_qpair* qpair, void* buf)
@@ -511,7 +514,9 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	if (ncd_ctx->lba_num > ncd_ctx->lba_mask)
 		chosen_lba_num = ncd_ctx->lba_mask;
 	else
-		chosen_lba_num = ncd_ctx->lba_num;
+		// The subtraction of 1 is because the LBA amount in the SQ command is a 0 based
+		// value, meaining that 0 actually copies 1 LBA, 1 copies 2 LBAs and so on.
+		chosen_lba_num = ncd_ctx->lba_num-1;
 	nfb_comp_write16(dma_ctx->comp, REG_LBA_AMOUNT, chosen_lba_num);
 	nfb_comp_write16(dma_ctx->comp, REG_LBA_MASK, ncd_ctx->lba_mask);
 
@@ -571,10 +576,10 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 		switch (op) {
 		case 's':
 			ctx->lba_num = spdk_strtol(optarg, 10);
-			/* if (ctx->lba_num < 0) { */
-			/* 	fprintf(stderr, "Invalid amount of LBAs, assigning to 0 ...\n"); */
-			/* 	ctx->lba_num = 0; */
-			/* } */
+			if (ctx->lba_num < 1) {
+				fprintf(stderr, "Invalid amount of LBAs, assigning to 1 ...\n");
+				ctx->lba_num = 1;
+			}
 			break;
 		case 'i':
 			env_opts->shm_id = spdk_strtol(optarg, 10);
@@ -643,9 +648,9 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 
 	// 1. SKIP Enable device (Apparently, it is enabled by the dpdk-devbind)
 	// 2. map BARs for both, the Completion Queueu, and the Data Transmission
-	rc = spdk_pci_device_map_bar(pci_dev, 0, &probe_ctx->cq_bar_vaddr, &probe_ctx->cq_bar_paddr, &probe_ctx->cq_bar_size);
+	rc = spdk_pci_device_map_bar(pci_dev, 1, &probe_ctx->cq_bar_vaddr, &probe_ctx->cq_bar_paddr, &probe_ctx->cq_bar_size);
 	if (rc) {
-		fprintf(stderr, "Unable to map BAR 0\n");
+		fprintf(stderr, "Unable to map BAR 1\n");
 		return rc;
 	}
 
@@ -713,6 +718,7 @@ main(int argc, char **argv)
 
 	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
 	ctx.trid = &trid;
+	ctx.lba_num = 1;
 
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
@@ -826,13 +832,17 @@ main(int argc, char **argv)
 	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x24);
 	usleep(1);
 	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x3);
-	printf("NCD command written (READ of %u LBAs)\n", ctx.lba_num);
+	printf("NCD run to generate commands (READ of %u LBAs)\n", ctx.lba_num);
+
+	signal(SIGINT, sig_usr);
+	signal(SIGTERM, sig_usr);
 
 	usleep(1000);
 	spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_vaddr);
-	while (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL)) {
+
+
+	while (!stop) // && (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL)))
 		usleep(1000);
-	}
 
 	dma_ctrl_close(&dma_ctx);
 
