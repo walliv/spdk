@@ -5,6 +5,8 @@
  *   Copyright (C) Vladislav Válek
  */
 
+#include <stdint.h>
+#include <stdlib.h>
 #include <sys/queue.h>
 
 #include <signal.h>
@@ -33,7 +35,7 @@
 #define REG_CQHDBL_BASE_ADDR    0x2C
 #define REG_PRP_ENTRY_1_ADDR    0x34
 #define REG_PRP_ENTRY_2_ADDR    0x3C
-#define REG_START_LBA_PTR       0x44
+#define REG_START_LBA_PTR_LOW   0x44
 #define REG_LBA_AMOUNT          0x48
 #define REG_LAST_CQ_ENTRY       0x4C
 #define REG_SQES_DISPATCHED     0x5C
@@ -45,6 +47,17 @@
 #define REG_PROC_RDS            0x8C
 #define REG_PROC_RDS_BYTES      0x94
 #define REG_LBA_MASK            0x9C
+#define REG_START_LBA_PTR_HIGH  0xCC
+#define REG_LBA_SPACE_SIZE      0xD0
+#define REG_CMDS_TO_DISP_CNTR_LOAD 0xD8
+
+#define CTRL_LOAD_CNTR    (1 << 0)
+#define CTRL_RD_EN        (1 << 1)
+#define CTRL_CONTIG_DISP  (1 << 2)
+#define CTRL_SAMPLE_STATS (1 << 3)
+#define CTRL_CLR_ERR_MASK (1 << 4)
+#define CTRL_CNTRS_RST    (1 << 5)
+#define CTRL_SEQV_RW      (1 << 6)
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr	*ctrlr;
@@ -71,10 +84,16 @@ struct qop_cpl_ctx {
 };
 
 struct ncd_probe_ctx {
+	uint32_t cmds_to_disp;
+	uint16_t qsize;
+	bool contiguous_dispatch;
 	struct spdk_nvme_transport_id *trid;
 	uint32_t nsid;
 	struct spdk_pci_device *dev;
-	struct spdk_nvme_cmd *sq_vaddr;
+	/* struct spdk_nvme_cmd *sq_vaddr; */
+	void *sq_bar_vaddr;
+	uint64_t sq_bar_paddr;
+	uint64_t sq_bar_size;
 	void *cq_bar_vaddr;
 	uint64_t cq_bar_paddr;
 	uint64_t cq_bar_size;
@@ -88,7 +107,7 @@ struct ncd_probe_ctx {
 	// The values that need to be written into the C/S registers before
 	// command gets to be dispatched.
 	uint16_t dbl_mask;
-	uint64_t sq_paddr;
+	/* uint64_t sq_paddr; */
 	uint64_t sqtdbl_paddr;
 	uint64_t cqhdbl_paddr;
 	uint16_t lba_mask;
@@ -189,48 +208,31 @@ static int
 queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 {
 	int			       rc = 0;
-	int32_t			       numa_id;
 	struct spdk_nvme_io_qpair_opts qopts;
-	uint64_t                       buff_req_size;
 	struct spdk_nvme_cmd           cmd = {0};
-	size_t                         queue_align;
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(g_namespace.ctrlr, &qopts, sizeof(struct spdk_nvme_io_qpair_opts));
 
-	printf("Queue pair options:\n");
+	printf("Default queue pair options:\n");
 	printf("IO queue size: %d\n", qopts.io_queue_size);
 	printf("IO queue requests: %d\n", qopts.io_queue_requests);
 
-	qopts.io_queue_requests = qopts.io_queue_size;
+	if (ncd_ctx->qsize == 0) {
+		qopts.io_queue_requests = qopts.io_queue_size;
+	} else {
+		qopts.io_queue_requests = ncd_ctx->qsize;
+		qopts.io_queue_size = ncd_ctx->qsize;
+	}
+
 	ncd_ctx->dbl_mask = qopts.io_queue_size -1;
 
-	buff_req_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cmd);
-	numa_id = spdk_nvme_ctrlr_get_numa_id(g_namespace.ctrlr);
-	queue_align = spdk_max(spdk_align32pow2(buff_req_size), sysconf(_SC_PAGESIZE));
-	// NOTE: The memory alignment needs to be aligned to the memory page size as specified in CC.MPS
-	// register of the NVMe controller
-	ncd_ctx->sq_vaddr = spdk_dma_zmalloc_socket(buff_req_size, queue_align, NULL, numa_id);
-	if (ncd_ctx->sq_vaddr == NULL) {
-		fprintf(stderr, "ERROR: Failed to alloc SQ buffer\n");
-		rc = -1;
-		goto sq_memalloc_fail;
-	}
-
-	qopts.sq.vaddr = ncd_ctx->sq_vaddr;
-	qopts.sq.paddr = spdk_vtophys(ncd_ctx->sq_vaddr, &buff_req_size);
-	if (qopts.sq.paddr == SPDK_VTOPHYS_ERROR) {
-		fprintf(stderr, "ERROR: Unable to return physical address of an underlying buffer.");
-		rc = -2;
-		goto vtophys_fail;
-	}
-	ncd_ctx->sq_paddr = qopts.sq.paddr;
-	printf("SQ VADD: %p, SQ PADDR: %lx\n", qopts.sq.vaddr, qopts.sq.paddr);
+	qopts.sq.vaddr = ncd_ctx->sq_bar_vaddr;
+	qopts.sq.paddr = ncd_ctx->sq_bar_paddr;
 	qopts.sq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cmd);
 
 	qopts.cq.vaddr = ncd_ctx->cq_bar_vaddr;
 	qopts.cq.paddr = ncd_ctx->cq_bar_paddr;
 	qopts.cq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cpl);
-
 
 	// Reset the Completion Queue in the Hardware, otherwise previous completion entries get
 	// detected
@@ -243,7 +245,7 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	if (g_namespace.hw_qid < 0) {
 		printf("ERROR: Failed to allocated QID for the HW queues\n");
 		rc = -13;
-		goto vtophys_fail;
+		goto qid_alloc_fail;
 
 	}
 
@@ -262,7 +264,7 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	rc = submit_admin_request(&cmd, "CQ_CREATE");
 	if (rc) {
 		printf("Failed to submit the Admin command!\n");
-		goto vtophys_fail;
+		goto cq_create_fail;
 	}
 
 	printf("HW CQ allocated!\n");
@@ -274,7 +276,7 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	cmd.cdw11_bits.create_io_sq.pc = 1;
 	cmd.cdw11_bits.create_io_sq.qprio = 2;
 	cmd.cdw11_bits.create_io_sq.cqid = g_namespace.hw_qid;
-	cmd.dptr.prp.prp1 = ncd_ctx->sq_paddr;
+	cmd.dptr.prp.prp1 = ncd_ctx->sq_bar_paddr;
 
 	rc = submit_admin_request(&cmd, "SQ_CREATE");
 	if (rc) {
@@ -311,9 +313,9 @@ sq_create_fail:
 		printf("Failed to submit the Admin command!\n");
 	}
 
-vtophys_fail:
-	spdk_dma_free(ncd_ctx->sq_vaddr);
-sq_memalloc_fail:
+cq_create_fail:
+	spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+qid_alloc_fail:
 	return rc;
 }
 
@@ -343,7 +345,6 @@ queues_dealloc(struct ncd_probe_ctx *ncd_ctx)
 	queues_delete(ncd_ctx);
 	/* spdk_nvme_ctrlr_free_io_qpair(g_namespace.sw_qpair); */
 	spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
-	spdk_dma_free(ncd_ctx->sq_vaddr);
 }
 
 static bool
@@ -502,12 +503,12 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	// Send a reset and wait until its done
 	nfb_comp_write8(dlogger, 0, 1);
 	while(!(nfb_comp_read8(dlogger, 0) & 2));
-	printf("Reset of the Command Dispatcher done!\n");
+	printf("Reset of DMA Iuventus done!\n");
 
 	nfb_comp_close(dlogger);
 
 	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, ncd_ctx->dbl_mask);
-	nfb_comp_write64(dma_ctx->comp, REG_SQ_BASE_ADDR, ncd_ctx->sq_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_SQ_BASE_ADDR, 0);
 	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BASE_ADDR, ncd_ctx->sqtdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BASE_ADDR, ncd_ctx->cqhdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_1_ADDR, ncd_ctx->data_bar_paddr);
@@ -542,6 +543,7 @@ usage(const char *program_name)
 	printf("%s [options]", program_name);
 	printf("\t\n");
 	printf("options:\n");
+	printf("\t[-c dispatches commands continuously otherwise specify the amount with -p flag]\n");
 	printf("\t[-d DPDK huge memory size in MB]\n");
 	printf("\t[-g use single file descriptor for DPDK memory segments]\n");
 	printf("\t[-i shared memory group ID]\n");
@@ -562,7 +564,9 @@ usage(const char *program_name)
 	printf("\t\t  hostnqn     Host NQN\n");
 	printf("\t\t Example: -t 'trtype:PCIe traddr:0000:04:00.0' for PCIe\n");
 	printf("\t\t Note: Currently, only PCIe transfer are supported for one device only\n");
-	printf("\t[-s the amount of LBAs to copy]\n");
+	printf("\t[-s <num> the amount of LBAs to copy within a single command]\n");
+	printf("\t[-q <num> size of the queues in items (Commands for SQ or Completions for CQ)]\n");
+	printf("\t[-p <num> the amount of commands to dispatch]\n");
 }
 
 bool ctrl_rst_done = true;
@@ -572,13 +576,30 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 {
 	int op, rc;
 
-	while ((op = getopt(argc, argv, "s:i:gd:L:hrt:")) != -1) {
+	while ((op = getopt(argc, argv, "s:i:gd:L:hrt:cq:p:")) != -1) {
 		switch (op) {
+		case 'p':
+			ctx->cmds_to_disp = spdk_strtol(optarg, 10);
+			if (ctx->cmds_to_disp < 1) {
+				fprintf(stderr, "Invalid amount of commands to dispatch (must be greater than 0)\n");
+				exit(EXIT_FAILURE);
+			}
+			break;
+		case 'q':
+			ctx->qsize = spdk_strtol(optarg, 10);
+			if (ctx->qsize < 4) {
+				fprintf(stderr, "Invalid size of a queue\n");
+				exit(EXIT_FAILURE);
+			}
+			break;
+		case 'c':
+			ctx->contiguous_dispatch = true;
+			break;
 		case 's':
 			ctx->lba_num = spdk_strtol(optarg, 10);
 			if (ctx->lba_num < 1) {
-				fprintf(stderr, "Invalid amount of LBAs, assigning to 1 ...\n");
-				ctx->lba_num = 1;
+				fprintf(stderr, "Invalid amount of LBAs\n");
+				exit(EXIT_FAILURE);
 			}
 			break;
 		case 'i':
@@ -647,7 +668,14 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	spdk_pci_device_cfg_write16(pci_dev, cmd_reg, 4);
 
 	// 1. SKIP Enable device (Apparently, it is enabled by the dpdk-devbind)
-	// 2. map BARs for both, the Completion Queueu, and the Data Transmission
+	// 2. map BARs for Submission Queue, Completion Queueu, and the Data Transmission
+
+	rc = spdk_pci_device_map_bar(pci_dev, 0, &probe_ctx->sq_bar_vaddr, &probe_ctx->sq_bar_paddr, &probe_ctx->sq_bar_size);
+	if (rc) {
+		fprintf(stderr, "Unable to map BAR 0\n");
+		return rc;
+	}
+
 	rc = spdk_pci_device_map_bar(pci_dev, 1, &probe_ctx->cq_bar_vaddr, &probe_ctx->cq_bar_paddr, &probe_ctx->cq_bar_size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR 1\n");
@@ -716,15 +744,24 @@ main(int argc, char **argv)
 
 	char *buf = NULL;
 
+	// Assign default attributes
 	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
 	ctx.trid = &trid;
 	ctx.lba_num = 1;
+	ctx.contiguous_dispatch = false;
+	ctx.qsize = 0;
+	ctx.cmds_to_disp = 0;
 
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
 	rc = parse_args(argc, argv, &opts, &ctx);
 	if (rc != 0) {
 		return rc;
+	}
+
+	if (ctx.cmds_to_disp == 0 && !ctx.contiguous_dispatch) {
+		fprintf(stderr, "Specify the amount of commands to dispatch or enable contiguous dispatch\n");
+		return -1;
 	}
 
 	opts.name = "fpga_zero_copy";
@@ -781,6 +818,9 @@ main(int argc, char **argv)
 
 	printf("PCIE domain initialization complete\n");
 	printf("NCD PCIe device context:\n");
+	printf("\tSQ BAR VADDR: %p\n", ctx.sq_bar_vaddr);
+	printf("\tSQ BAR PADDR: %lx\n", ctx.sq_bar_paddr);
+	printf("\tSQ BAR size:  %ld\n", ctx.sq_bar_size);
 	printf("\tCQ BAR VADDR: %p\n", ctx.cq_bar_vaddr);
 	printf("\tCQ BAR PADDR: %lx\n", ctx.cq_bar_paddr);
 	printf("\tCQ BAR size:  %ld\n", ctx.cq_bar_size);
@@ -829,19 +869,29 @@ main(int argc, char **argv)
 	}
 
 	// Can be commented out if we want to keep statistics between runs
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x24);
+	nfb_comp_write64(dma_ctx.comp, REG_LBA_SPACE_SIZE, 0x000000000FFFFFFF);
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_CNTRS_RST | CTRL_RD_EN);
+	nfb_comp_write32(dma_ctx.comp, REG_CMDS_TO_DISP_CNTR_LOAD, ctx.cmds_to_disp);
 	usleep(1);
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, 0x3);
-	printf("NCD run to generate commands (READ of %u LBAs)\n", ctx.lba_num);
+
+	uint8_t regval = CTRL_SEQV_RW | CTRL_RD_EN | CTRL_LOAD_CNTR;
+	if (ctx.contiguous_dispatch)
+		regval |= CTRL_CONTIG_DISP;
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, regval);
+	printf("NCD run to generate commands (READ of %u LBAs), contiguous_dispatch: %d\n", ctx.lba_num, ctx.contiguous_dispatch);
 
 	signal(SIGINT, sig_usr);
 	signal(SIGTERM, sig_usr);
 
 	usleep(1000);
-	spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_vaddr);
+	spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
 
+	while (!stop && ctx.contiguous_dispatch) usleep(1000);
 
-	while (!stop) // && (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL)))
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
+	printf("Stopping NCD generator\n");
+
+	while (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL))
 		usleep(1000);
 
 	dma_ctrl_close(&dma_ctx);
