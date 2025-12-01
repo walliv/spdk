@@ -357,6 +357,15 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	printf("Probing %s ...\n", trid->traddr);
 
+	if (probe_ctx->qsize != 0) {
+		opts->io_queue_size = probe_ctx->qsize;
+		opts->io_queue_requests = probe_ctx->qsize;
+	} else {
+		opts->io_queue_requests = opts->io_queue_size;
+	}
+	opts->arb_mechanism = SPDK_NVME_CC_AMS_RR;
+	opts->enable_interrupts = false;
+
 	if (!strcmp(trid->traddr, probe_ctx->trid->traddr))
 		return true;
 
