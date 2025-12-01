@@ -8,8 +8,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/queue.h>
-
+#include <libfdt.h>
 #include <signal.h>
+
 #include <nfb/nfb.h>
 
 #include "spdk/stdinc.h"
@@ -76,6 +77,7 @@ struct ns_entry {
 struct dma_ctrl_ctx {
 	struct nfb_device *dev;
 	struct nfb_comp *comp;
+	const char *pcie_bdf;
 };
 
 struct qop_cpl_ctx {
@@ -475,6 +477,38 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	probe_ctx->nsid = nsid;
 }
 
+static int dma_dev_init(const char* select_dev, struct dma_ctrl_ctx *dma_ctx)
+{
+	int rc = 0;
+	const void *fdt;
+	int fdt_offset;
+	int len;
+
+	dma_ctx->dev = nfb_open(select_dev);
+	if(!dma_ctx->dev) {
+		fprintf(stderr, "ERROR: Failed to open NFB device");
+		rc = -1;
+		goto dev_open_fail;
+	}
+
+	fdt = nfb_get_fdt(dma_ctx->dev);
+	fdt_offset = fdt_path_offset(fdt, "/system/device/endpoint0");
+	dma_ctx->pcie_bdf = fdt_getprop(fdt, fdt_offset, "pci-slot", &len);
+	if (len < 0) {
+		fprintf(stderr, "ERROR: Failed to get pci-slot from device's Device Tree!\n");
+		rc = -2;
+		goto fdt_get_fail;
+
+	}
+
+	return 0;
+
+fdt_get_fail:
+	nfb_close(dma_ctx->dev);
+dev_open_fail:
+	return rc;
+}
+
 static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
 {
 	int rc = 0;
@@ -482,17 +516,10 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	struct nfb_comp *dlogger;
 	uint16_t chosen_lba_num;
 
-	dma_ctx->dev = nfb_open(ncd_ctx->select_dev);
-	if(!dma_ctx->dev) {
-		fprintf(stderr, "ERROR: Failed to open NFB device");
-		rc = -1;
-		goto dev_open_fail;
-	}
-
 	node = nfb_comp_find(dma_ctx->dev, "ziti,dma_iuventus", 0);
 	dma_ctx->comp = nfb_comp_open(dma_ctx->dev, node);
 	if (dma_ctx->comp == NULL) {
-		fprintf(stderr, "ERROR: Failed to open DMA control registers as nfb_comp");
+		fprintf(stderr, "ERROR: Failed to open DMA control registers as nfb_comp!\n");
 		rc = -2;
 		goto dma_open_fail;
 	}
@@ -500,7 +527,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	node = nfb_comp_find(dma_ctx->dev, "netcope,dma_iops_meter", 0);
 	dlogger = nfb_comp_open(dma_ctx->dev, node);
 	if (dlogger == NULL) {
-		fprintf(stderr, "ERROR: Failed to open Data Logger as nfb_comp");
+		fprintf(stderr, "ERROR: Failed to open Data Logger as nfb_comp!\n");
 		rc = -3;
 		goto dlogger_open_fail;
 	}
@@ -532,15 +559,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 dlogger_open_fail:
 	nfb_comp_close(dma_ctx->comp);
 dma_open_fail:
-	nfb_close(dma_ctx->dev);
-dev_open_fail:
 	return rc;
-}
-
-static void dma_ctrl_close(struct dma_ctrl_ctx *dma_ctx)
-{
-	nfb_comp_close(dma_ctx->comp);
-	nfb_close(dma_ctx->dev);
 }
 
 static void
@@ -667,7 +686,7 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	int rc;
 	uint16_t cmd_reg;
 	struct ncd_probe_ctx *probe_ctx = ctx;
-	uint64_t mem_register_start;
+	/* uint64_t mem_register_start; */
 		/* mem_register_end; */
 
 	probe_ctx->dev = pci_dev;
@@ -739,7 +758,7 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	/* } */
 
 	return 0;
-}
+ }
 
 int
 main(int argc, char **argv)
@@ -815,16 +834,24 @@ main(int argc, char **argv)
 		goto ctrlr_reset_fail;
 	}
 
-	rc = spdk_pci_addr_parse(&pcie_addr, "0000:61:00.1");
+	rc = dma_dev_init(ctx.select_dev, &dma_ctx);
+	if (rc) {
+		fprintf(stderr, "Error initializing DMA NFB Device\n");
+		goto dma_dev_init_fail;
+	}
+
+	rc = spdk_pci_addr_parse(&pcie_addr, dma_ctx.pcie_bdf);
 	if (rc) {
 		fprintf(stderr, "Unable to parse PCIE address!\n");
-		goto ctrlr_reset_fail;
+		goto dma_dev_init_fail;
 	}
+
+	pcie_addr.func += 1;
 
 	rc = spdk_pci_device_attach(ncd_driver, ncd_drv_attach_cb, &ctx, &pcie_addr);
 	if (rc) {
 		fprintf(stderr, "Unable to attach PCIE device!\n");
-		goto ctrlr_reset_fail;
+		goto dma_dev_init_fail;
 	}
 
 	printf("PCIE domain initialization complete\n");
@@ -875,7 +902,7 @@ main(int argc, char **argv)
 
 	rc = dma_ctrl_init(&ctx, &dma_ctx);
 	if (rc) {
-		fprintf(stderr, "Error opening the DMA Iuventus controller structure\n");
+		fprintf(stderr, "Error configuring the DMA Iuventus controller structure\n");
 		goto dma_ctrl_alloc_fail;
 	}
 
@@ -907,8 +934,7 @@ main(int argc, char **argv)
 
 	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
 
-	dma_ctrl_close(&dma_ctx);
-
+	nfb_comp_close(dma_ctx.comp);
 /* buf_alloc_fail: */
 dma_ctrl_alloc_fail:
 	queues_dealloc(&ctx);
@@ -919,6 +945,8 @@ queue_alloc_fail:
 	spdk_pci_device_detach(ctx.dev);
 	printf("Pcie dev detached\n");
 	/* fflush(stdout); */
+dma_dev_init_fail:
+	nfb_close(dma_ctx.dev);
 ctrlr_reset_fail:
 	spdk_nvme_detach(g_controller.ctrlr);
 	printf("NVME Controller detached\n");

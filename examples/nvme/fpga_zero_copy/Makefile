@@ -5,6 +5,7 @@
 
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 
-APP = fpga_zero_copy
+APP=fpga_zero_copy
+LDFLAGS+=-lfdt -lnfb
 
 include $(SPDK_ROOT_DIR)/mk/nvme.libtest.mk
