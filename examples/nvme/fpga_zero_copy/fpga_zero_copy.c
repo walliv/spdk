@@ -682,13 +682,13 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, 1, &probe_ctx->cq_bar_vaddr, &probe_ctx->cq_bar_paddr, &probe_ctx->cq_bar_size);
+	rc = spdk_pci_device_map_bar(pci_dev, 2, &probe_ctx->cq_bar_vaddr, &probe_ctx->cq_bar_paddr, &probe_ctx->cq_bar_size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR 1\n");
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, 2, &probe_ctx->data_bar_vaddr, &probe_ctx->data_bar_paddr, &probe_ctx->data_bar_size);
+	rc = spdk_pci_device_map_bar(pci_dev, 4, &probe_ctx->data_bar_vaddr, &probe_ctx->data_bar_paddr, &probe_ctx->data_bar_size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR 2\n");
 		return rc;
