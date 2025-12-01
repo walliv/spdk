@@ -58,6 +58,7 @@
 #define CTRL_CLR_ERR_MASK (1 << 4)
 #define CTRL_CNTRS_RST    (1 << 5)
 #define CTRL_SEQV_RW      (1 << 6)
+#define CTRL_RPT_UPD_EN   (1 << 7)
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr	*ctrlr;
@@ -880,7 +881,7 @@ main(int argc, char **argv)
 	nfb_comp_write32(dma_ctx.comp, REG_CMDS_TO_DISP_CNTR_LOAD, ctx.cmds_to_disp);
 	usleep(1);
 
-	uint8_t regval = CTRL_SEQV_RW | CTRL_RD_EN | CTRL_LOAD_CNTR;
+	uint32_t regval = CTRL_SEQV_RW | CTRL_RD_EN | CTRL_LOAD_CNTR | CTRL_RPT_UPD_EN;
 	if (ctx.contiguous_dispatch)
 		regval |= CTRL_CONTIG_DISP;
 	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, regval);
@@ -894,11 +895,13 @@ main(int argc, char **argv)
 
 	while (!stop && ctx.contiguous_dispatch) usleep(1000);
 
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN | CTRL_RPT_UPD_EN);
 	printf("Stopping NCD generator\n");
 
 	while (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL))
 		usleep(1000);
+
+	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
 
 	dma_ctrl_close(&dma_ctx);
 
