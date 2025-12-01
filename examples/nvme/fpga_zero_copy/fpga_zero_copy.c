@@ -508,6 +508,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BASE_ADDR, ncd_ctx->sqtdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BASE_ADDR, ncd_ctx->cqhdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_1_ADDR, ncd_ctx->data_bar_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_2_ADDR, ncd_ctx->data_bar_paddr + VALUE_4KB);
 	if (ncd_ctx->lba_num > ncd_ctx->lba_mask)
 		chosen_lba_num = ncd_ctx->lba_mask;
 	else
