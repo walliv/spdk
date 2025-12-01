@@ -494,7 +494,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 		goto dma_open_fail;
 	}
 
-	node = nfb_comp_find(dma_ctx->dev, "ziti,dma_iops_meter", 0);
+	node = nfb_comp_find(dma_ctx->dev, "netcope,dma_iops_meter", 0);
 	dlogger = nfb_comp_open(dma_ctx->dev, node);
 	if (dlogger == NULL) {
 		fprintf(stderr, "ERROR: Failed to open Data Logger as nfb_comp");
