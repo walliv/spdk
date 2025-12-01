@@ -84,6 +84,7 @@ struct qop_cpl_ctx {
 };
 
 struct ncd_probe_ctx {
+	const char *select_dev;
 	uint32_t cmds_to_disp;
 	uint16_t qsize;
 	bool contiguous_dispatch;
@@ -477,7 +478,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	struct nfb_comp *dlogger;
 	uint16_t chosen_lba_num;
 
-	dma_ctx->dev = nfb_open("/dev/nfb/by-pci-slot/0000:61:00.0");
+	dma_ctx->dev = nfb_open(ncd_ctx->select_dev);
 	if(!dma_ctx->dev) {
 		fprintf(stderr, "ERROR: Failed to open NFB device");
 		rc = -1;
@@ -544,7 +545,8 @@ usage(const char *program_name)
 	printf("\t\n");
 	printf("options:\n");
 	printf("\t[-c dispatches commands continuously otherwise specify the amount with -p flag]\n");
-	printf("\t[-d DPDK huge memory size in MB]\n");
+	printf("\t[-d selected nfb device (default 0)]\n");
+	printf("\t[-m DPDK huge memory size in MB]\n");
 	printf("\t[-g use single file descriptor for DPDK memory segments]\n");
 	printf("\t[-i shared memory group ID]\n");
 #ifdef DEBUG
@@ -576,8 +578,11 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 {
 	int op, rc;
 
-	while ((op = getopt(argc, argv, "s:i:gd:L:hrt:cq:p:")) != -1) {
+	while ((op = getopt(argc, argv, "s:i:gm:L:hrt:cq:p:d:")) != -1) {
 		switch (op) {
+		case 'd':
+			ctx->select_dev = optarg;
+			break;
 		case 'p':
 			ctx->cmds_to_disp = spdk_strtol(optarg, 10);
 			if (ctx->cmds_to_disp < 1) {
@@ -612,7 +617,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 		case 'g':
 			env_opts->hugepage_single_segments = true;
 			break;
-		case 'd':
+		case 'm':
 			env_opts->mem_size = spdk_strtol(optarg, 10);
 			if (env_opts->mem_size < 0) {
 				fprintf(stderr, "Invalid DPDK memory size\n");
@@ -751,6 +756,7 @@ main(int argc, char **argv)
 	ctx.contiguous_dispatch = false;
 	ctx.qsize = 0;
 	ctx.cmds_to_disp = 0;
+	ctx.select_dev = "0";
 
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
