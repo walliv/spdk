@@ -370,7 +370,6 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	int nsid;
 	struct spdk_nvme_ns *ns;
 	const struct spdk_nvme_ctrlr_data *cdata;
-	const struct spdk_nvme_ctrlr_opts *copts;
 	struct spdk_pci_device *pci_dev;
 	struct spdk_pci_addr pci_addr;
 	char bdf[32];
@@ -422,19 +421,14 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	}
 
 	printf("Controller options:\n");
-	copts = spdk_nvme_ctrlr_get_opts(ctrlr);
-	if (copts == NULL) {
-		fprintf(stderr, "No controller options found!");
-		return;
-	}
 
-	printf("\tNumber of IO queues:   %d\n", copts->num_io_queues);
-	printf("\tSize of IO queues:     %d\n", copts->io_queue_size);
-	printf("\tIO queue requests:     %d\n", copts->io_queue_requests);
+	printf("\tNumber of IO queues:   %d\n", opts->num_io_queues);
+	printf("\tSize of IO queues:     %d\n", opts->io_queue_size);
+	printf("\tIO queue requests:     %d\n", opts->io_queue_requests);
 	printf("\tNS %d size:             %juGB\n", nsid, spdk_nvme_ns_get_size(ns) / 1000000000);
 	printf("\tNS number of sectors:  %ld\n", spdk_nvme_ns_get_num_sectors(ns));
 	printf("\tNS sector size:        %dB\n", sect_size);
-	printf("\tLBA Mask:              %x\n", probe_ctx->lba_mask);
+	printf("\tLBA Mask:              x%x (%d)\n", probe_ctx->lba_mask, probe_ctx->lba_mask);
 
 	pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
 	if (!pci_dev) {
