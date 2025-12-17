@@ -60,6 +60,7 @@
 #define CTRL_CNTRS_RST    (1 << 5)
 #define CTRL_SEQV_RW      (1 << 6)
 #define CTRL_RPT_UPD_EN   (1 << 7)
+#define CTRL_CQE_PROC_EN  (1 << 8)
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr	*ctrlr;
@@ -908,14 +909,14 @@ main(int argc, char **argv)
 
 	// Can be commented out if we want to keep statistics between runs
 	nfb_comp_write64(dma_ctx.comp, REG_LBA_SPACE_SIZE, 0x000000000FFFFFFF);
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_CNTRS_RST | CTRL_RD_EN);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_CNTRS_RST | CTRL_RD_EN);
 	nfb_comp_write32(dma_ctx.comp, REG_CMDS_TO_DISP_CNTR_LOAD, ctx.cmds_to_disp);
 	usleep(1);
 
-	uint32_t regval = CTRL_SEQV_RW | CTRL_RD_EN | CTRL_LOAD_CNTR | CTRL_RPT_UPD_EN;
+	uint32_t regval = CTRL_CQE_PROC_EN | CTRL_SEQV_RW | CTRL_RD_EN | CTRL_LOAD_CNTR | CTRL_RPT_UPD_EN;
 	if (ctx.contiguous_dispatch)
 		regval |= CTRL_CONTIG_DISP;
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, regval);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, regval);
 	printf("NCD run to generate commands (READ of %u LBAs), contiguous_dispatch: %d\n", ctx.lba_num, ctx.contiguous_dispatch);
 
 	signal(SIGINT, sig_usr);
@@ -924,15 +925,15 @@ main(int argc, char **argv)
 	usleep(1000);
 	spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
 
-	while (!stop && ctx.contiguous_dispatch) usleep(1000);
+	while (!stop && ctx.contiguous_dispatch) usleep(10000);
 
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN | CTRL_RPT_UPD_EN);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_CQE_PROC_EN | CTRL_SEQV_RW | CTRL_RD_EN | CTRL_RPT_UPD_EN);
 	printf("Stopping NCD generator\n");
 
 	while (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL))
-		usleep(1000);
+		usleep(1000000);
 
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
 
 	nfb_comp_close(dma_ctx.comp);
 /* buf_alloc_fail: */
