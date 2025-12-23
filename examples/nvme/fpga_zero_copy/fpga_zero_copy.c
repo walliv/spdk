@@ -243,10 +243,10 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	qopts.cq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cpl);
 
 	// Reset the Completion Queue in the Hardware, otherwise previous completion entries get
-	// detected
-	struct spdk_nvme_cpl *cpl_buff = ncd_ctx->cq_bar_vaddr;
-	for (uint32_t i = 0; i < qopts.io_queue_size; i++) {
-		cpl_buff[i].status.p = 0;
+	// detected. This means return Phase Tags to value 0 (i.e. default value)
+	uint8_t *cpl_buff = ncd_ctx->cq_bar_vaddr;
+	for (uint32_t i = 14; i < (qopts.io_queue_size*16); i+=16) {
+		cpl_buff[i] = 0;
 	}
 
 	g_namespace.hw_qid = spdk_nvme_ctrlr_alloc_qid(g_namespace.ctrlr);
