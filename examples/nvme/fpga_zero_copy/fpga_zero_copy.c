@@ -132,6 +132,9 @@ static struct spdk_pci_id ncd_pci_driver_id[] = {
 	{
 		SPDK_PCI_DEVICE(0x18ec, 0xc020)
 	},
+	{
+		SPDK_PCI_DEVICE(0x1c2c, 0xc020)
+	},
 };
 
 SPDK_PCI_DRIVER_REGISTER(ncd, ncd_pci_driver_id, SPDK_PCI_DRIVER_NEED_MAPPING)
@@ -718,6 +721,19 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 		return rc;
 	}
 
+        if (probe_ctx->cq_bar_vaddr == NULL || probe_ctx->sq_bar_vaddr == NULL || probe_ctx->data_bar_vaddr == NULL) {
+		fprintf(stderr, "Virtual BAR adresses invalid!\n");
+		return -1;
+        }
+        if (probe_ctx->cq_bar_paddr == 0 || probe_ctx->sq_bar_paddr == 0 || probe_ctx->data_bar_paddr == 0) {
+		fprintf(stderr, "Physical BAR adresses invalid!\n");
+		return -2;
+        }
+        if (probe_ctx->cq_bar_size <= 0 || probe_ctx->sq_bar_size <= 0 || probe_ctx->data_bar_size <= 0) {
+		fprintf(stderr, "BAR sizes invalid!\n");
+		return -3;
+        }
+                        
 	/* printf("CQ BAR VADDR: %p\n", probe_ctx->cq_bar_vaddr); */
 	/* printf("CQ BAR PADDR: %lx\n", probe_ctx->cq_bar_paddr); */
 	/* printf("CQ BAR size:  %ld\n", probe_ctx->cq_bar_size); */
@@ -923,7 +939,7 @@ main(int argc, char **argv)
 	signal(SIGTERM, sig_usr);
 
 	usleep(1000);
-	spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
+	//spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
 
 	while (!stop && ctx.contiguous_dispatch) usleep(10000);
 
