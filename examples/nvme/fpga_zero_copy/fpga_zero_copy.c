@@ -16,6 +16,7 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/nvme.h"
+#include "spdk/nvme_spec.h"
 #include "spdk/vmd.h"
 #include "spdk/env.h"
 #include "spdk/string.h"
@@ -375,6 +376,18 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 }
 
 static void
+rd_ctrl_regs(struct spdk_nvme_ctrlr *ctrlr)
+{
+	union spdk_nvme_csts_register csts = spdk_nvme_ctrlr_get_regs_csts(ctrlr);
+	printf("Controller CSTS register:\n");
+	printf("\tCSTS.RDY: %d\n", csts.bits.rdy);
+	printf("\tCSTS.CFS: %d\n", csts.bits.cfs);
+	printf("\tCSTS.SHST: %d\n", csts.bits.shst);
+	printf("\tCSTS.NSSRO: %d\n", csts.bits.nssro);
+	printf("\tCSTS.PS: %d\n", csts.bits.pp);
+}
+
+static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
@@ -441,6 +454,8 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("\tNS sector size:        %dB\n", sect_size);
 	printf("\tLBA Mask:              x%x (%d)\n", probe_ctx->lba_num_mask, probe_ctx->lba_num_mask);
 	probe_ctx->lba_space_size = spdk_nvme_ns_get_num_sectors(ns);
+
+	rd_ctrl_regs(ctrlr);
 
 	pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
 	if (!pci_dev) {
@@ -991,6 +1006,8 @@ main(int argc, char **argv)
 	}
 
 	dma_ctrl_deinit(&ctx, &dma_ctx);
+
+	rd_ctrl_regs(g_namespace.ctrlr);
 
 /* buf_alloc_fail: */
 dma_ctrl_alloc_fail:
