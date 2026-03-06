@@ -242,7 +242,7 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	// Reset the Completion Queue in the Hardware, otherwise previous completion entries get
 	// detected. This means return Phase Tags to value 0 (i.e. default value)
 	uint8_t *cpl_buff = ncd_ctx->cq_vaddr;
-	for (uint32_t i = 14; i < (qopts.io_queue_size*16); i+=16) {
+	for (uint32_t i = 14; i < qopts.cq.buffer_size; i+=sizeof(struct spdk_nvme_cpl)) {
 		cpl_buff[i] = 0;
 	}
 
