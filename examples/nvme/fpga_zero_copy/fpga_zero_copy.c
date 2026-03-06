@@ -786,16 +786,16 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	}
 
 	if (probe_ctx->cq_vaddr == NULL || probe_ctx->sq_vaddr == NULL || probe_ctx->rdbuff_vaddr == NULL || probe_ctx->wrbuff_vaddr == NULL) {
-	fprintf(stderr, "Virtual BAR adresses invalid!\n");
-	return -1;
+		fprintf(stderr, "Virtual BAR adresses invalid!\n");
+		return -1;
 	}
 	if (probe_ctx->cq_paddr == 0 || probe_ctx->sq_paddr == 0 || probe_ctx->rdbuff_paddr == 0 || probe_ctx->wrbuff_paddr == 0) {
-	fprintf(stderr, "Physical BAR adresses invalid!\n");
-	return -2;
+		fprintf(stderr, "Physical BAR adresses invalid!\n");
+		return -2;
 	}
 	if (probe_ctx->cq_byte_size <= 0 || probe_ctx->sq_byte_size <= 0 || probe_ctx->rdbuff_byte_size <= 0 || probe_ctx->wrbuff_byte_size <= 0) {
-	fprintf(stderr, "BAR sizes invalid!\n");
-	return -3;
+		fprintf(stderr, "BAR sizes invalid!\n");
+		return -3;
 	}
 
 	/* printf("CQ BAR VADDR: %p\n", probe_ctx->cq_vaddr); */
