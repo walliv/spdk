@@ -662,7 +662,8 @@ usage(const char *program_name)
 	printf("\t[-p <num> the amount of commands to dispatch]\n");
 }
 
-bool ctrl_rst_done = true;
+bool do_ctrl_rst = false;
+bool do_subs_rst = false;
 
 static int
 parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_probe_ctx *ctx)
@@ -691,13 +692,9 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 		// case 'c':
 		// 	ctx->contiguous_dispatch = true;
 		// 	break;
-		// case 's':
-		// 	ctx->lba_num = spdk_strtol(optarg, 10);
-		// 	if (ctx->lba_num < 1) {
-		// 		fprintf(stderr, "Invalid amount of LBAs\n");
-		// 		exit(EXIT_FAILURE);
-		// 	}
-		// 	break;
+		case 's':
+			do_subs_rst = true;
+			break;
 		case 'i':
 			env_opts->shm_id = spdk_strtol(optarg, 10);
 			if (env_opts->shm_id < 0) {
@@ -737,7 +734,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 			usage(argv[0]);
 			exit(EXIT_SUCCESS);
 		case 'r':
-			ctrl_rst_done = false;
+			do_ctrl_rst = true;
 			break;
 		default:
 			usage(argv[0]);
@@ -868,18 +865,21 @@ main(int argc, char **argv)
 		goto nvme_probe_fail;
 	}
 
-	if (!ctrl_rst_done) {
+	if (do_ctrl_rst) {
 		printf("Resetting controller...");
 		if (spdk_nvme_ctrlr_reset(g_controller.ctrlr)) {
 			fprintf(stderr, "Failed to reset controller!");
 			rc = -11;
-			goto ctrlr_reset_fail;
 		}
+		goto ctrlr_reset_fail;
+	}
+
+	if (do_subs_rst) {
 		if (spdk_nvme_ctrlr_reset_subsystem(g_controller.ctrlr)) {
 			fprintf(stderr, "Failed to reset subsystem!");
 			rc = -12;
-			goto ctrlr_reset_fail;
 		}
+		goto ctrlr_reset_fail;
 	}
 
 	ncd_driver = spdk_pci_get_driver("ncd");
