@@ -114,7 +114,6 @@ struct ncd_probe_ctx {
 	uint64_t cqhdbl_paddr;
 	uint16_t lba_num_mask;
 	uint64_t lba_space_size;
-	void *meta_dummy_buf;
 };
 
 volatile int stop = 0;
@@ -600,30 +599,10 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 		goto dma_open_fail;
 	}
 
-	ncd_ctx->meta_dummy_buf = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
-	if (ncd_ctx->meta_dummy_buf == NULL) {
-		fprintf(stderr, "ERROR: Metadata dummy buffer allocation failed\n");
-		rc = -3;
-		goto buf_alloc_fail;
-	}
-
-	meta_buff_paddr = spdk_vtophys(ncd_ctx->meta_dummy_buf, &meta_buff_size);
-	if (meta_buff_paddr == SPDK_VTOPHYS_ERROR) {
-		fprintf(stderr, "ERROR: Failed to get physical address of the metadata dummy buffer\n");
-		rc = -4;
-		goto vtophys_map_fail;
-	}
-
-	if (meta_buff_size != VALUE_4KB) {
-		fprintf(stderr, "ERROR: Metadata dummy buffer size is not 4096 bytes (detected size: %lu)\n", meta_buff_size);
-		rc = -5;
-		goto vtophys_map_fail;
-	}
-
 	rc = prp_list_alloc(ncd_ctx);
 	if (rc) {
 		fprintf(stderr, "ERROR: PRP list allocation failed\n");
-		goto vtophys_map_fail;
+		goto prp_alloc_fail;
 	}
 
 	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, ncd_ctx->dbl_mask);
@@ -635,12 +614,10 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_PRP_LIST_PTR, ncd_ctx->wrbuff_prp_list_paddr);
 	nfb_comp_write16(dma_ctx->comp, REG_LBA_NUM_MASK, ncd_ctx->lba_num_mask);
 	nfb_comp_write64(dma_ctx->comp, REG_LBA_SPACE_SIZE, ncd_ctx->lba_space_size);
-	nfb_comp_write64(dma_ctx->comp, REG_META_PTR, meta_buff_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_META_PTR, 0);
 	return 0;
 
-vtophys_map_fail:
-	spdk_dma_free(ncd_ctx->meta_dummy_buf);
-buf_alloc_fail:
+prp_alloc_fail:
 	nfb_comp_close(dma_ctx->comp);
 dma_open_fail:
 	return rc;
@@ -649,7 +626,6 @@ dma_open_fail:
 static void dma_ctrl_deinit(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
 {
 	prp_list_free(ncd_ctx);
-	spdk_dma_free(ncd_ctx->meta_dummy_buf);
 	nfb_comp_close(dma_ctx->comp);
 }
 
