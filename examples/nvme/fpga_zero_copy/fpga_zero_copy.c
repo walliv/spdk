@@ -660,54 +660,61 @@ host_fs_fini(void)
  * End of Host Filesystem Bdev Module
  * ============================================================ */
 
-struct dma_ctrl_ctx {
+struct fpga_bar_ctx {
+	void *vaddr;
+	uint64_t paddr;
+	uint64_t size;
+};
+
+struct fpga_prp_list_ctx {
+	void *vaddr;
+	uint64_t paddr;
+};
+
+struct dma_device_ctx {
 	struct nfb_device *dev;
 	struct nfb_comp *comp;
 	const char *pcie_bdf;
 };
 
-struct qop_cpl_ctx {
-	char cmd_name[20];
-	int qop_completed;
-	int32_t qid;
+struct admin_cmd_ctx {
+	const char *cmd_name;
+	bool done;
+	int status;
 };
 
-struct ncd_probe_ctx {
-	const char *select_dev;
-	uint16_t qsize;
-	struct spdk_nvme_transport_id *trid;
+struct fpga_hw_ctx {
+	struct spdk_pci_device *pci_dev;
 	uint32_t nsid;
-	struct spdk_pci_device *dev;
+	bool qid_allocated;
+	bool cq_created;
+	bool sq_created;
+	bool prp_lists_allocated;
 
-	void *sq_vaddr;
-	uint64_t sq_paddr;
-	uint64_t sq_byte_size;
-	void *cq_vaddr;
-	uint64_t cq_paddr;
-	uint64_t cq_byte_size;
-	void *wrbuff_vaddr;
-	uint64_t wrbuff_paddr;
-	uint64_t wrbuff_byte_size;
-	void *rdbuff_vaddr;
-	uint64_t rdbuff_paddr;
-	uint64_t rdbuff_byte_size;
+	struct fpga_bar_ctx sq;
+	struct fpga_bar_ctx cq;
+	struct fpga_bar_ctx wrbuff;
+	struct fpga_bar_ctx rdbuff;
 
-	void *wrbuff_prp_list_vaddr;
-	uint64_t wrbuff_prp_list_paddr;
-	void *rdbuff_prp_list_vaddr;
-	uint64_t rdbuff_prp_list_paddr;
+	struct fpga_prp_list_ctx wrbuff_prp_list;
+	struct fpga_prp_list_ctx rdbuff_prp_list;
 
 	uint64_t doorbell_base;
 	uint32_t doorbell_stride;
 
-	// The values that need to be written into the C/S registers before
-	// command gets to be dispatched.
-	uint16_t dbl_mask;
-	/* uint64_t sq_paddr; */
+	/* Values programmed into the FPGA command-dispatch registers. */
+	uint16_t doorbell_mask;
 	uint64_t sqtdbl_paddr;
 	uint64_t cqhdbl_paddr;
 	uint16_t lba_num_mask;
 	uint64_t lba_space_size;
+};
+
+struct app_ctx {
+	const char *select_dev;
+	uint16_t qsize;
+	struct spdk_nvme_transport_id *trid;
+	struct fpga_hw_ctx hw;
 };
 
 volatile int stop = 0;
@@ -733,47 +740,47 @@ SPDK_PCI_DRIVER_REGISTER(ncd, ncd_pci_driver_id, SPDK_PCI_DRIVER_NEED_MAPPING)
 static void
 qop_complete_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
 {
-	struct qop_cpl_ctx *qctx = ctx;
+	struct admin_cmd_ctx *cmd_ctx = ctx;
 
-	qctx->qop_completed = 1;
+	cmd_ctx->done = true;
 	if (spdk_nvme_cpl_is_error(cpl)) {
-		spdk_nvme_print_completion(qctx->qid, (struct spdk_nvme_cpl *)cpl);
+		spdk_nvme_print_completion(0, (struct spdk_nvme_cpl *)cpl);
 		fprintf(stderr, "CPL error status: %s\n", spdk_nvme_cpl_get_status_string(&cpl->status));
-		fprintf(stderr, "%s failed, aborting run\n", qctx->cmd_name);
-		qctx->qop_completed = -1;
+		fprintf(stderr, "%s failed, aborting run\n", cmd_ctx->cmd_name);
+		cmd_ctx->status = -1;
 	}
 }
 
 static int
-submit_admin_request(struct spdk_nvme_cmd* cmd, char *cmd_name)
+submit_admin_request(struct spdk_nvme_cmd *cmd, const char *cmd_name)
 {
 	int rc = 0;
-	struct qop_cpl_ctx qctx = {0};
+	struct admin_cmd_ctx cmd_ctx = {
+		.cmd_name = cmd_name,
+	};
 
-	snprintf(qctx.cmd_name, sizeof(qctx.cmd_name), "%s", cmd_name);
-	qctx.qop_completed = 0;
-	qctx.qid = 0;
-	rc = spdk_nvme_ctrlr_cmd_admin_raw(g_namespace.ctrlr, cmd, NULL, 0, qop_complete_cb, &qctx);
+	rc = spdk_nvme_ctrlr_cmd_admin_raw(g_namespace.ctrlr, cmd, NULL, 0, qop_complete_cb, &cmd_ctx);
 	if (rc) {
-		printf("Failed to submit the command %s!\n", qctx.cmd_name);
+		printf("Failed to submit the command %s!\n", cmd_ctx.cmd_name);
 		return -1;
 	}
 
-	while (!qctx.qop_completed)
+	while (!cmd_ctx.done)
 		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
 
-	if (qctx.qop_completed == -1)
+	if (cmd_ctx.status != 0)
 		return -2;
 
 	return 0;
 }
 
 static int
-queues_alloc(struct ncd_probe_ctx *ncd_ctx)
+queues_alloc(struct app_ctx *app_ctx)
 {
 	int			       rc = 0;
 	struct spdk_nvme_io_qpair_opts qopts;
 	struct spdk_nvme_cmd           cmd = {0};
+	struct fpga_hw_ctx *hw = &app_ctx->hw;
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(g_namespace.ctrlr, &qopts, sizeof(struct spdk_nvme_io_qpair_opts));
 
@@ -781,26 +788,26 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	printf("IO queue size: %d\n", qopts.io_queue_size);
 	printf("IO queue requests: %d\n", qopts.io_queue_requests);
 
-	if (ncd_ctx->qsize == 0) {
+	if (app_ctx->qsize == 0) {
 		qopts.io_queue_requests = qopts.io_queue_size;
 	} else {
-		qopts.io_queue_requests = ncd_ctx->qsize;
-		qopts.io_queue_size = ncd_ctx->qsize;
+		qopts.io_queue_requests = app_ctx->qsize;
+		qopts.io_queue_size = app_ctx->qsize;
 	}
 
-	ncd_ctx->dbl_mask = qopts.io_queue_size -1;
+	hw->doorbell_mask = qopts.io_queue_size - 1;
 
-	qopts.sq.vaddr = ncd_ctx->sq_vaddr;
-	qopts.sq.paddr = ncd_ctx->sq_paddr;
-	qopts.sq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cmd);
+	qopts.sq.vaddr = hw->sq.vaddr;
+	qopts.sq.paddr = hw->sq.paddr;
+	qopts.sq.buffer_size = qopts.io_queue_size * sizeof(struct spdk_nvme_cmd);
 
-	qopts.cq.vaddr = ncd_ctx->cq_vaddr;
-	qopts.cq.paddr = ncd_ctx->cq_paddr;
-	qopts.cq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cpl);
+	qopts.cq.vaddr = hw->cq.vaddr;
+	qopts.cq.paddr = hw->cq.paddr;
+	qopts.cq.buffer_size = qopts.io_queue_size * sizeof(struct spdk_nvme_cpl);
 
 	// Reset the Completion Queue in the Hardware, otherwise previous completion entries get
 	// detected. This means return Phase Tags to value 0 (i.e. default value)
-	uint8_t *cpl_buff = ncd_ctx->cq_vaddr;
+	uint8_t *cpl_buff = hw->cq.vaddr;
 	for (uint32_t i = 14; i < qopts.cq.buffer_size; i+=sizeof(struct spdk_nvme_cpl)) {
 		cpl_buff[i] = 0;
 	}
@@ -812,112 +819,125 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 		goto qid_alloc_fail;
 
 	}
+	hw->qid_allocated = true;
 
-	ncd_ctx->sqtdbl_paddr = ncd_ctx->doorbell_base + (2*g_namespace.hw_qid) * (4 << ncd_ctx->doorbell_stride);
-	ncd_ctx->cqhdbl_paddr = ncd_ctx->doorbell_base + (2*g_namespace.hw_qid+1) * (4 << ncd_ctx->doorbell_stride);
+	hw->sqtdbl_paddr = hw->doorbell_base + (2 * g_namespace.hw_qid) * (4 << hw->doorbell_stride);
+	hw->cqhdbl_paddr = hw->doorbell_base + (2 * g_namespace.hw_qid + 1) * (4 << hw->doorbell_stride);
 
 	printf("Allocate qid %d\n", g_namespace.hw_qid);
 
 	cmd.opc = SPDK_NVME_OPC_CREATE_IO_CQ;
 	cmd.nsid = 0;
 	cmd.cdw10_bits.create_io_q.qid = g_namespace.hw_qid;
-	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size-1;
+	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
 	cmd.cdw11_bits.create_io_cq.pc = 1;
-	cmd.dptr.prp.prp1 = ncd_ctx->cq_paddr;
+	cmd.dptr.prp.prp1 = hw->cq.paddr;
 
 	rc = submit_admin_request(&cmd, "CQ_CREATE");
 	if (rc) {
 		printf("Failed to submit the Admin command!\n");
 		goto cq_create_fail;
 	}
+	hw->cq_created = true;
 
 	printf("HW CQ allocated!\n");
 
 	cmd.opc = SPDK_NVME_OPC_CREATE_IO_SQ;
 	cmd.nsid = 0;
 	cmd.cdw10_bits.create_io_q.qid = g_namespace.hw_qid;
-	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size-1;
+	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
 	cmd.cdw11_bits.create_io_sq.pc = 1;
 	cmd.cdw11_bits.create_io_sq.qprio = 2;
 	cmd.cdw11_bits.create_io_sq.cqid = g_namespace.hw_qid;
-	cmd.dptr.prp.prp1 = ncd_ctx->sq_paddr;
+	cmd.dptr.prp.prp1 = hw->sq.paddr;
 
 	rc = submit_admin_request(&cmd, "SQ_CREATE");
 	if (rc) {
 		printf("Failed to submit the Admin command!\n");
 		goto sq_create_fail;
 	}
+	hw->sq_created = true;
 
 	printf("HW SQ allocated!\n");
 
 	return 0;
 
-	cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
-	cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-	rc = submit_admin_request(&cmd, "SQ_DELETE");
-	if (rc) {
-		printf("Failed to submit Admin command!\n");
-	}
-
 sq_create_fail:
-	cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
-	cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-	rc = submit_admin_request(&cmd, "CQ_DELETE");
-	if (rc) {
-		printf("Failed to submit the Admin command!\n");
+	if (hw->cq_created) {
+		cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
+		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
+		rc = submit_admin_request(&cmd, "CQ_DELETE");
+		if (rc) {
+			printf("Failed to submit the Admin command!\n");
+		}
+		hw->cq_created = false;
 	}
 
 cq_create_fail:
-	spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+	if (hw->qid_allocated) {
+		spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+		hw->qid_allocated = false;
+		g_namespace.hw_qid = -1;
+	}
 qid_alloc_fail:
 	return rc;
 }
 
-static void queues_delete(struct ncd_probe_ctx *ncd_ctx)
+static void queues_delete(struct fpga_hw_ctx *hw)
 {
 	int rc = 0;
 	struct spdk_nvme_cmd cmd = {0};
 
-	cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
-	cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-	rc = submit_admin_request(&cmd, "SQ_DELETE");
-	if (rc) {
-		printf("Failed to submit Admin command!\n");
+	if (hw->sq_created) {
+		cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
+		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
+		rc = submit_admin_request(&cmd, "SQ_DELETE");
+		if (rc) {
+			printf("Failed to submit Admin command!\n");
+		}
+		hw->sq_created = false;
 	}
 
-	cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
-	cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-	rc = submit_admin_request(&cmd, "CQ_DELETE");
-	if (rc) {
-		printf("Failed to submit the Admin command!\n");
+	if (hw->cq_created) {
+		cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
+		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
+		rc = submit_admin_request(&cmd, "CQ_DELETE");
+		if (rc) {
+			printf("Failed to submit the Admin command!\n");
+		}
+		hw->cq_created = false;
 	}
 }
 
 static void
-queues_dealloc(struct ncd_probe_ctx *ncd_ctx)
+queues_dealloc(struct fpga_hw_ctx *hw)
 {
-	queues_delete(ncd_ctx);
-	spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+	queues_delete(hw);
+	if (hw->qid_allocated) {
+		spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+		hw->qid_allocated = false;
+		g_namespace.hw_qid = -1;
+	}
 }
 
 static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
 {
-	struct ncd_probe_ctx *probe_ctx = cb_ctx;
+	struct app_ctx *app_ctx = cb_ctx;
 
 	printf("Probing %s ...\n", trid->traddr);
 
-	if (probe_ctx->qsize != 0) {
-		opts->io_queue_size = probe_ctx->qsize;
-		opts->io_queue_requests = probe_ctx->qsize;
+	if (app_ctx->qsize != 0) {
+		opts->io_queue_size = app_ctx->qsize;
+		opts->io_queue_requests = app_ctx->qsize;
 	} else {
 		opts->io_queue_requests = opts->io_queue_size;
 	}
 	opts->arb_mechanism = SPDK_NVME_CC_AMS_RR;
 	opts->enable_interrupts = false;
 
-	if (!strcmp(trid->traddr, probe_ctx->trid->traddr))
+	if (!strcmp(trid->traddr, app_ctx->trid->traddr))
 		return true;
 
 	return false;
@@ -949,7 +969,8 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	uint64_t bar_start, bar_end, bar_flags;
 	FILE *fp;
 	union spdk_nvme_cap_register cap;
-	struct ncd_probe_ctx *probe_ctx = cb_ctx;
+	struct app_ctx *app_ctx = cb_ctx;
+	struct fpga_hw_ctx *hw = &app_ctx->hw;
 	uint32_t sect_size;
 
 	printf("Attaching to %s ...\n", trid->traddr);
@@ -987,9 +1008,9 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	// Unlimited Max Data transfer size
 	if (cdata->mdts == 0) {
-		probe_ctx->lba_num_mask = 0xFFFF;
+		hw->lba_num_mask = 0xFFFF;
 	} else {
-		probe_ctx->lba_num_mask = (uint16_t)((1 << (12 + cap.bits.mpsmin + cdata->mdts)) / sect_size) - 1;
+		hw->lba_num_mask = (uint16_t)((1 << (12 + cap.bits.mpsmin + cdata->mdts)) / sect_size) - 1;
 	}
 
 	printf("Controller options:\n");
@@ -1000,8 +1021,8 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("\tNS %d size:             %juGB\n", nsid, spdk_nvme_ns_get_size(ns) / 1000000000);
 	printf("\tNS number of sectors:  %ld\n", spdk_nvme_ns_get_num_sectors(ns));
 	printf("\tNS sector size:        %dB\n", sect_size);
-	printf("\tLBA Mask:              x%x (%d)\n", probe_ctx->lba_num_mask, probe_ctx->lba_num_mask);
-	probe_ctx->lba_space_size = spdk_nvme_ns_get_num_sectors(ns);
+	printf("\tLBA Mask:              x%x (%d)\n", hw->lba_num_mask, hw->lba_num_mask);
+	hw->lba_space_size = spdk_nvme_ns_get_num_sectors(ns);
 
 	rd_ctrl_regs(ctrlr);
 
@@ -1035,13 +1056,13 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("Physical address of NVME BAR0: 0x%lx\n", bar_start);
 
 	// Doorbell registers start at offset 0x1000 from BAR0 but they start from the Admin Queues!
-	probe_ctx->doorbell_base = bar_start + 0x1000;
-	probe_ctx->doorbell_stride = cap.bits.dstrd;
-	printf("Doorbell stride: %d\n", probe_ctx->doorbell_stride);
-	probe_ctx->nsid = nsid;
+	hw->doorbell_base = bar_start + 0x1000;
+	hw->doorbell_stride = cap.bits.dstrd;
+	printf("Doorbell stride: %d\n", hw->doorbell_stride);
+	hw->nsid = nsid;
 }
 
-static int dma_dev_init(const char* select_dev, struct dma_ctrl_ctx *dma_ctx)
+static int dma_dev_init(const char *select_dev, struct dma_device_ctx *dma_ctx)
 {
 	int rc = 0;
 	const void *fdt;
@@ -1069,84 +1090,104 @@ static int dma_dev_init(const char* select_dev, struct dma_ctrl_ctx *dma_ctx)
 
 fdt_get_fail:
 	nfb_close(dma_ctx->dev);
+	dma_ctx->dev = NULL;
 dev_open_fail:
 	return rc;
 }
 
-static int prp_list_alloc(struct ncd_probe_ctx *ncd_ctx)
+static int prp_list_alloc(struct fpga_hw_ctx *hw)
 {
 	uint64_t size = VALUE_4KB;
-	ncd_ctx->wrbuff_prp_list_vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
-	if (ncd_ctx->wrbuff_prp_list_vaddr == NULL) {
+	hw->wrbuff_prp_list.vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
+	if (hw->wrbuff_prp_list.vaddr == NULL) {
 		fprintf(stderr, "ERROR: Write PRP list allocation failed\n");
 		return -1;
 	}
 
-	ncd_ctx->rdbuff_prp_list_vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
-	if (ncd_ctx->rdbuff_prp_list_vaddr == NULL) {
+	hw->rdbuff_prp_list.vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
+	if (hw->rdbuff_prp_list.vaddr == NULL) {
 		fprintf(stderr, "ERROR: Read PRP list allocation failed\n");
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
 		return -2;
 	}
 
-	ncd_ctx->wrbuff_prp_list_paddr = spdk_vtophys(ncd_ctx->wrbuff_prp_list_vaddr, &size);
-	if (ncd_ctx->wrbuff_prp_list_paddr == SPDK_VTOPHYS_ERROR) {
+	hw->wrbuff_prp_list.paddr = spdk_vtophys(hw->wrbuff_prp_list.vaddr, &size);
+	if (hw->wrbuff_prp_list.paddr == SPDK_VTOPHYS_ERROR) {
 		fprintf(stderr, "ERROR: Failed to get physical address of the Write PRP list buffer\n");
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
 		return -3;
 	}
 
 	if (size != VALUE_4KB) {
 		fprintf(stderr, "ERROR: Write PRP list buffer size is not 4096 bytes (detected size: %lu)\n", size);
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
 		return -4;
 	}
 
-	ncd_ctx->rdbuff_prp_list_paddr = spdk_vtophys(ncd_ctx->rdbuff_prp_list_vaddr, &size);
-	if (ncd_ctx->rdbuff_prp_list_paddr == SPDK_VTOPHYS_ERROR) {
+	hw->rdbuff_prp_list.paddr = spdk_vtophys(hw->rdbuff_prp_list.vaddr, &size);
+	if (hw->rdbuff_prp_list.paddr == SPDK_VTOPHYS_ERROR) {
 		fprintf(stderr, "ERROR: Failed to get physical address of the Read PRP list buffer\n");
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
 		return -5;
 	}
 
 	if (size != VALUE_4KB) {
 		fprintf(stderr, "ERROR: Read PRP list buffer size is not 4096 bytes (detected size: %lu)\n", size);
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
 		return -6;
 	}
 
-	for (int i = 1; i < (int)(ncd_ctx->wrbuff_byte_size / VALUE_4KB); i++) {
-		((uint64_t *)ncd_ctx->wrbuff_prp_list_vaddr)[i-1] = ncd_ctx->wrbuff_paddr + (i * VALUE_4KB);
-		((uint64_t *)ncd_ctx->rdbuff_prp_list_vaddr)[i-1] = ncd_ctx->rdbuff_paddr + (i * VALUE_4KB);
+	for (int i = 1; i < (int)(hw->wrbuff.size / VALUE_4KB); i++) {
+		((uint64_t *)hw->wrbuff_prp_list.vaddr)[i - 1] = hw->wrbuff.paddr + (i * VALUE_4KB);
+		((uint64_t *)hw->rdbuff_prp_list.vaddr)[i - 1] = hw->rdbuff.paddr + (i * VALUE_4KB);
 	}
+	hw->prp_lists_allocated = true;
 
 	return 0;
 }
 
-static void prp_list_free(struct ncd_probe_ctx *ncd_ctx)
+static void prp_list_free(struct fpga_hw_ctx *hw)
 {
-	spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-	spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
-}
-
-static void prp_list_print(struct ncd_probe_ctx *ncd_ctx)
-{
-	printf("Write PRP List (vaddr: %p, paddr: 0x%lx):\n", ncd_ctx->wrbuff_prp_list_vaddr, ncd_ctx->wrbuff_prp_list_paddr);
-	for (int i = 0; i < (int)(ncd_ctx->wrbuff_byte_size / VALUE_4KB)-1; i++) {
-		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)ncd_ctx->wrbuff_prp_list_vaddr)[i]);
+	if (!hw->prp_lists_allocated) {
+		return;
 	}
 
-	printf("Read PRP List (vaddr: %p, paddr: 0x%lx):\n", ncd_ctx->rdbuff_prp_list_vaddr, ncd_ctx->rdbuff_prp_list_paddr);
-	for (int i = 0; i < (int)(ncd_ctx->rdbuff_byte_size / VALUE_4KB)-1; i++) {
-		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)ncd_ctx->rdbuff_prp_list_vaddr)[i]);
+	spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+	spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+	hw->wrbuff_prp_list.vaddr = NULL;
+	hw->rdbuff_prp_list.vaddr = NULL;
+	hw->wrbuff_prp_list.paddr = 0;
+	hw->rdbuff_prp_list.paddr = 0;
+	hw->prp_lists_allocated = false;
+}
+
+static void prp_list_print(const struct fpga_hw_ctx *hw)
+{
+	printf("Write PRP List (vaddr: %p, paddr: 0x%lx):\n", hw->wrbuff_prp_list.vaddr, hw->wrbuff_prp_list.paddr);
+	for (int i = 0; i < (int)(hw->wrbuff.size / VALUE_4KB) - 1; i++) {
+		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)hw->wrbuff_prp_list.vaddr)[i]);
+	}
+
+	printf("Read PRP List (vaddr: %p, paddr: 0x%lx):\n", hw->rdbuff_prp_list.vaddr, hw->rdbuff_prp_list.paddr);
+	for (int i = 0; i < (int)(hw->rdbuff.size / VALUE_4KB) - 1; i++) {
+		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)hw->rdbuff_prp_list.vaddr)[i]);
 	}
 }
 
-static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
+static int dma_ctrl_init(struct fpga_hw_ctx *hw, struct dma_device_ctx *dma_ctx)
 {
 	int rc = 0;
 	int node;
@@ -1159,34 +1200,38 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 		goto dma_open_fail;
 	}
 
-	rc = prp_list_alloc(ncd_ctx);
+	rc = prp_list_alloc(hw);
 	if (rc) {
 		fprintf(stderr, "ERROR: PRP list allocation failed\n");
 		goto prp_alloc_fail;
 	}
 
-	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, ncd_ctx->dbl_mask);
-	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BADDR, ncd_ctx->sqtdbl_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BADDR, ncd_ctx->cqhdbl_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_BADDR, ncd_ctx->rdbuff_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_PRP_LIST_PTR, ncd_ctx->rdbuff_prp_list_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_BADDR, ncd_ctx->wrbuff_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_PRP_LIST_PTR, ncd_ctx->wrbuff_prp_list_paddr);
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_NUM_MASK, ncd_ctx->lba_num_mask);
-	nfb_comp_write64(dma_ctx->comp, REG_LBA_SPACE_SIZE, ncd_ctx->lba_space_size);
+	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, hw->doorbell_mask);
+	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BADDR, hw->sqtdbl_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BADDR, hw->cqhdbl_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_BADDR, hw->rdbuff.paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_PRP_LIST_PTR, hw->rdbuff_prp_list.paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_BADDR, hw->wrbuff.paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_PRP_LIST_PTR, hw->wrbuff_prp_list.paddr);
+	nfb_comp_write16(dma_ctx->comp, REG_LBA_NUM_MASK, hw->lba_num_mask);
+	nfb_comp_write64(dma_ctx->comp, REG_LBA_SPACE_SIZE, hw->lba_space_size);
 	nfb_comp_write64(dma_ctx->comp, REG_META_PTR, 0);
 	return 0;
 
 prp_alloc_fail:
 	nfb_comp_close(dma_ctx->comp);
+	dma_ctx->comp = NULL;
 dma_open_fail:
 	return rc;
 }
 
-static void dma_ctrl_deinit(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
+static void dma_ctrl_deinit(struct fpga_hw_ctx *hw, struct dma_device_ctx *dma_ctx)
 {
-	prp_list_free(ncd_ctx);
-	nfb_comp_close(dma_ctx->comp);
+	prp_list_free(hw);
+	if (dma_ctx->comp != NULL) {
+		nfb_comp_close(dma_ctx->comp);
+		dma_ctx->comp = NULL;
+	}
 }
 
 static void
@@ -1229,7 +1274,7 @@ bool do_ctrl_rst = false;
 bool do_subs_rst = false;
 
 static int
-parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_probe_ctx *ctx)
+parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct app_ctx *ctx)
 {
 	int op, rc;
 
@@ -1302,9 +1347,10 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 {
 	int rc;
 	uint16_t cmd_reg;
-	struct ncd_probe_ctx *probe_ctx = ctx;
+	struct app_ctx *app_ctx = ctx;
+	struct fpga_hw_ctx *hw = &app_ctx->hw;
 
-	probe_ctx->dev = pci_dev;
+	hw->pci_dev = pci_dev;
 
 	/* Enable Memory accesses, PCI busmaster and disable INTx */
 	spdk_pci_device_cfg_read16(pci_dev, &cmd_reg, 4);
@@ -1314,39 +1360,39 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	// 1. SKIP Enable device (Apparently, it is enabled by the dpdk-devbind)
 	// 2. map BARs for Submission Queue, Completion Queueu, and the Data Transmission
 
-	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR, &probe_ctx->sq_vaddr, &probe_ctx->sq_paddr, &probe_ctx->sq_byte_size);
+	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR, &hw->sq.vaddr, &hw->sq.paddr, &hw->sq.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR %d (SQ)\n", SQ_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR, &probe_ctx->cq_vaddr, &probe_ctx->cq_paddr, &probe_ctx->cq_byte_size);
+	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR, &hw->cq.vaddr, &hw->cq.paddr, &hw->cq.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR %d (CQ)\n", CQ_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &probe_ctx->wrbuff_vaddr, &probe_ctx->wrbuff_paddr, &probe_ctx->wrbuff_byte_size);
+	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &hw->wrbuff.vaddr, &hw->wrbuff.paddr, &hw->wrbuff.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR %d (WR buffer)\n", WRBUFF_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &probe_ctx->rdbuff_vaddr, &probe_ctx->rdbuff_paddr, &probe_ctx->rdbuff_byte_size);
+	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &hw->rdbuff.vaddr, &hw->rdbuff.paddr, &hw->rdbuff.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR %d (RD buffer)\n", RDBUFF_BAR);
 		return rc;
 	}
 
-	if (probe_ctx->cq_vaddr == NULL || probe_ctx->sq_vaddr == NULL || probe_ctx->rdbuff_vaddr == NULL || probe_ctx->wrbuff_vaddr == NULL) {
+	if (hw->cq.vaddr == NULL || hw->sq.vaddr == NULL || hw->rdbuff.vaddr == NULL || hw->wrbuff.vaddr == NULL) {
 		fprintf(stderr, "Virtual BAR adresses invalid!\n");
 		return -1;
 	}
-	if (probe_ctx->cq_paddr == 0 || probe_ctx->sq_paddr == 0 || probe_ctx->rdbuff_paddr == 0 || probe_ctx->wrbuff_paddr == 0) {
+	if (hw->cq.paddr == 0 || hw->sq.paddr == 0 || hw->rdbuff.paddr == 0 || hw->wrbuff.paddr == 0) {
 		fprintf(stderr, "Physical BAR adresses invalid!\n");
 		return -2;
 	}
-	if (probe_ctx->cq_byte_size <= 0 || probe_ctx->sq_byte_size <= 0 || probe_ctx->rdbuff_byte_size <= 0 || probe_ctx->wrbuff_byte_size <= 0) {
+	if (hw->cq.size == 0 || hw->sq.size == 0 || hw->rdbuff.size == 0 || hw->wrbuff.size == 0) {
 		fprintf(stderr, "BAR sizes invalid!\n");
 		return -3;
 	}
@@ -1362,18 +1408,20 @@ main(int argc, char **argv)
 	struct spdk_pci_driver *ncd_driver;
 	struct spdk_nvme_transport_id trid = {0};
 	struct spdk_pci_addr pcie_addr;
-	struct ncd_probe_ctx ctx = {0};
-	struct dma_ctrl_ctx dma_ctx = {0};
+	struct app_ctx app_ctx = {0};
+	struct dma_device_ctx dma_ctx = {0};
+	struct fpga_hw_ctx *hw = &app_ctx.hw;
 
 	// Assign default attributes
 	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
-	ctx.trid = &trid;
-	ctx.qsize = 0;
-	ctx.select_dev = "0";
+	app_ctx.trid = &trid;
+	app_ctx.qsize = 0;
+	app_ctx.select_dev = "0";
+	g_namespace.hw_qid = -1;
 
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
-	rc = parse_args(argc, argv, &opts, &ctx);
+	rc = parse_args(argc, argv, &opts, &app_ctx);
 	if (rc != 0) {
 		return rc;
 	}
@@ -1385,7 +1433,7 @@ main(int argc, char **argv)
 	}
 
 	printf("Initializing NVMe Controller for device %s\n", trid.traddr);
-	rc = spdk_nvme_probe(NULL, &ctx, probe_cb, attach_cb, NULL);
+	rc = spdk_nvme_probe(NULL, &app_ctx, probe_cb, attach_cb, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "ERROR: spdk_nvme_probe() failed\n");
 		goto nvme_probe_fail;
@@ -1421,7 +1469,7 @@ main(int argc, char **argv)
 		goto ctrlr_reset_fail;
 	}
 
-	rc = dma_dev_init(ctx.select_dev, &dma_ctx);
+	rc = dma_dev_init(app_ctx.select_dev, &dma_ctx);
 	if (rc) {
 		fprintf(stderr, "Error initializing DMA NFB Device\n");
 		goto dma_dev_init_fail;
@@ -1435,7 +1483,7 @@ main(int argc, char **argv)
 
 	pcie_addr.func += 1;
 
-	rc = spdk_pci_device_attach(ncd_driver, ncd_drv_attach_cb, &ctx, &pcie_addr);
+	rc = spdk_pci_device_attach(ncd_driver, ncd_drv_attach_cb, &app_ctx, &pcie_addr);
 	if (rc) {
 		fprintf(stderr, "Unable to attach PCIE device!\n");
 		goto dma_dev_init_fail;
@@ -1443,35 +1491,35 @@ main(int argc, char **argv)
 
 	printf("PCIE domain initialization complete\n");
 	printf("NCD PCIe device context:\n");
-	printf("\tSQ VADDR: %p\n", ctx.sq_vaddr);
-	printf("\tSQ PADDR: %lx\n", ctx.sq_paddr);
-	printf("\tSQ size:  %ld bytes\n", ctx.sq_byte_size);
-	printf("\tCQ VADDR: %p\n", ctx.cq_vaddr);
-	printf("\tCQ PADDR: %lx\n", ctx.cq_paddr);
-	printf("\tCQ size:  %ld bytes\n", ctx.cq_byte_size);
-	printf("\tWRBUFF VADDR: %p\n", ctx.wrbuff_vaddr);
-	printf("\tWRBUFF PADDR: %lx\n", ctx.wrbuff_paddr);
-	printf("\tWRBUFF size:  %ld bytes\n", ctx.wrbuff_byte_size);
-	printf("\tRDBUFF VADDR: %p\n", ctx.rdbuff_vaddr);
-	printf("\tRDBUFF PADDR: %lx\n", ctx.rdbuff_paddr);
-	printf("\tRDBUFF size:  %ld bytes\n", ctx.rdbuff_byte_size);
+	printf("\tSQ VADDR: %p\n", hw->sq.vaddr);
+	printf("\tSQ PADDR: %lx\n", hw->sq.paddr);
+	printf("\tSQ size:  %ld bytes\n", hw->sq.size);
+	printf("\tCQ VADDR: %p\n", hw->cq.vaddr);
+	printf("\tCQ PADDR: %lx\n", hw->cq.paddr);
+	printf("\tCQ size:  %ld bytes\n", hw->cq.size);
+	printf("\tWRBUFF VADDR: %p\n", hw->wrbuff.vaddr);
+	printf("\tWRBUFF PADDR: %lx\n", hw->wrbuff.paddr);
+	printf("\tWRBUFF size:  %ld bytes\n", hw->wrbuff.size);
+	printf("\tRDBUFF VADDR: %p\n", hw->rdbuff.vaddr);
+	printf("\tRDBUFF PADDR: %lx\n", hw->rdbuff.paddr);
+	printf("\tRDBUFF size:  %ld bytes\n", hw->rdbuff.size);
 
-	rc = queues_alloc(&ctx);
+	rc = queues_alloc(&app_ctx);
 	if (rc) {
 		fprintf(stderr, "Unable to allocate queues!\n");
 		goto queue_alloc_fail;
 	}
-	printf("\tSQTDBL physical address: 0x%lx\n", ctx.sqtdbl_paddr);
-	printf("\tCQHDBL physical address: 0x%lx\n", ctx.cqhdbl_paddr);
+	printf("\tSQTDBL physical address: 0x%lx\n", hw->sqtdbl_paddr);
+	printf("\tCQHDBL physical address: 0x%lx\n", hw->cqhdbl_paddr);
 	printf("Queues allocated.\n");
 
-	rc = dma_ctrl_init(&ctx, &dma_ctx);
+	rc = dma_ctrl_init(hw, &dma_ctx);
 	if (rc) {
 		fprintf(stderr, "Error configuring the DMA Iuventus controller structure\n");
 		goto dma_ctrl_alloc_fail;
 	}
 
-	prp_list_print(&ctx);
+	prp_list_print(hw);
 
 	/*
 	 * Initialise the host-side filesystem path.  This registers a thin
@@ -1530,20 +1578,29 @@ main(int argc, char **argv)
 	/* Tear down the host filesystem before any lower-level cleanup. */
 	host_fs_fini();
 
-	dma_ctrl_deinit(&ctx, &dma_ctx);
+	dma_ctrl_deinit(hw, &dma_ctx);
 
 	rd_ctrl_regs(g_namespace.ctrlr);
 
 dma_ctrl_alloc_fail:
-	queues_dealloc(&ctx);
+	queues_dealloc(hw);
 	printf("Qeues dealloced\n");
 queue_alloc_fail:
-	spdk_pci_device_detach(ctx.dev);
+	if (hw->pci_dev != NULL) {
+		spdk_pci_device_detach(hw->pci_dev);
+		hw->pci_dev = NULL;
+	}
 	printf("Pcie dev detached\n");
 dma_dev_init_fail:
-	nfb_close(dma_ctx.dev);
+	if (dma_ctx.dev != NULL) {
+		nfb_close(dma_ctx.dev);
+		dma_ctx.dev = NULL;
+	}
 ctrlr_reset_fail:
-	spdk_nvme_detach(g_controller.ctrlr);
+	if (g_controller.ctrlr != NULL) {
+		spdk_nvme_detach(g_controller.ctrlr);
+		g_controller.ctrlr = NULL;
+	}
 	printf("NVME Controller detached\n");
 nvme_probe_fail:
 	spdk_env_fini();
