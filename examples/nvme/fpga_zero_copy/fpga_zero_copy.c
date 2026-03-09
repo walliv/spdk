@@ -768,41 +768,6 @@ submit_admin_request(struct spdk_nvme_cmd* cmd, char *cmd_name)
 	return 0;
 }
 
-// static int
-// submit_rw_request(uint8_t rw, struct spdk_nvme_qpair* qpair, void* buf)
-// {
-// 	int rc = 0;
-// 	struct qop_cpl_ctx qctx = {0};
-
-// 	int (*rw_op)(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, void *payload,
-// 			   uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn,
-// 			   void *cb_arg, uint32_t io_flags) = NULL;
-
-// 	// Read
-// 	if (rw == 1) {
-// 		rw_op = spdk_nvme_ns_cmd_read;
-// 	} else if (rw == 0) {
-// 		rw_op = spdk_nvme_ns_cmd_write;
-// 	}
-
-// 	snprintf(qctx.cmd_name, sizeof(qctx.cmd_name), "%s", (rw == 1) ? "RD" : "WR");
-// 	qctx.qop_completed = 0;
-// 	qctx.qid = spdk_nvme_qpair_get_id(qpair);
-// 	rc = rw_op(g_namespace.ns, qpair, buf, 0, 1, qop_complete_cb, &qctx, 0);
-// 	if (rc) {
-// 		fprintf(stderr, "Initial write of the control string to NVMe failed\n");
-// 		return -1;
-// 	}
-
-// 	while (!qctx.qop_completed)
-// 		spdk_nvme_qpair_process_completions(qpair, 0);
-
-// 	if (qctx.qop_completed == -1)
-// 		return -2;
-
-// 	return 0;
-// }
-
 static int
 queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 {
@@ -1229,9 +1194,8 @@ usage(const char *program_name)
 {
 	printf("%s [options]", program_name);
 	printf("\t\n");
-	printf("options:\n");
-	printf("\t[-c dispatches commands continuously otherwise specify the amount with -p flag]\n");
-	printf("\t[-d selected nfb device (default 0)]\n");
+	printf("\t[-h show this help]\n");
+	printf("SPDK options:\n");
 	printf("\t[-m DPDK huge memory size in MB]\n");
 	printf("\t[-g use single file descriptor for DPDK memory segments]\n");
 	printf("\t[-i shared memory group ID]\n");
@@ -1240,6 +1204,8 @@ usage(const char *program_name)
 #else
 	printf("\t[-L enable debug logging (flag disabled, must reconfigure with --enable-debug)]\n");
 #endif
+	printf("DMA Iuventus options:\n");
+	printf("\t[-d selected nfb device (default 0)]\n");
 	printf("\t[-t <fmt> Transport ID for local PCIe NVMe]\n");
 	printf("\t\t Format: 'key:value [key:value] ...'\n");
 	printf("\t\t Keys:\n");
@@ -1252,9 +1218,9 @@ usage(const char *program_name)
 	printf("\t\t  hostnqn     Host NQN\n");
 	printf("\t\t Example: -t 'trtype:PCIe traddr:0000:04:00.0' for PCIe\n");
 	printf("\t\t Note: Currently, only PCIe transfer are supported for one device only\n");
-	printf("\t[-s <num> the amount of LBAs to copy within a single command]\n");
-	printf("\t[-q <num> size of the queues in items (Commands for SQ or Completions for CQ)]\n");
-	printf("\t[-p <num> the amount of commands to dispatch]\n");
+	printf("\t[-s do a subsystem reset (i.e. hard reset, the PCIe device can disappear from the system)]\n");
+	printf("\t[-r do a controller reset (i.e. soft reset)]\n");
+	printf("\t[-q <num> size of the NVMe queues in items]\n");
 	printf("\t     Note: the NVMe namespace is exposed as /dev/ublkb%u via ublk.\n", NVME_HOST_UBLK_ID);
 	printf("\t           Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK=y.\n");
 }
@@ -1272,13 +1238,6 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 		case 'd':
 			ctx->select_dev = optarg;
 			break;
-		// case 'p':
-		// 	ctx->cmds_to_disp = spdk_strtol(optarg, 10);
-		// 	if (ctx->cmds_to_disp < 1) {
-		// 		fprintf(stderr, "Invalid amount of commands to dispatch (must be greater than 0)\n");
-		// 		exit(EXIT_FAILURE);
-		// 	}
-		// 	break;
 		case 'q':
 			ctx->qsize = spdk_strtol(optarg, 10);
 			if (ctx->qsize < 4) {
@@ -1286,9 +1245,6 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 				exit(EXIT_FAILURE);
 			}
 			break;
-		// case 'c':
-		// 	ctx->contiguous_dispatch = true;
-		// 	break;
 		case 's':
 			do_subs_rst = true;
 			break;
@@ -1394,25 +1350,6 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 		fprintf(stderr, "BAR sizes invalid!\n");
 		return -3;
 	}
-
-	/* printf("CQ BAR VADDR: %p\n", probe_ctx->cq_vaddr); */
-	/* printf("CQ BAR PADDR: %lx\n", probe_ctx->cq_paddr); */
-	/* printf("CQ BAR size:  %ld\n", probe_ctx->cq_byte_size); */
-	/* printf("DATA BAR VADDR: %p\n", probe_ctx->wrbuff_vaddr); */
-	/* printf("DATA BAR PADDR: %lx\n", probe_ctx->wrbuff_paddr); */
-	/* printf("DATA BAR size:  %ld\n", probe_ctx->wrbuff_byte_size); */
-
-	/* rc = spdk_pci_device_disable_interrupts(pci_dev); */
-	/* if (rc) { */
-	/* 	fprintf(stderr, "Unable to disable interrupts\n"); */
-	/* 	return rc; */
-	/* } */
-
-	/* rc = spdk_pci_device_disable_interrupt(pci_dev); */
-	/* if (rc) { */
-	/* 	fprintf(stderr, "Unable to disable interrupt\n"); */
-	/* 	return rc; */
-	/* } */
 
 	return 0;
  }
@@ -1528,30 +1465,6 @@ main(int argc, char **argv)
 	printf("\tCQHDBL physical address: 0x%lx\n", ctx.cqhdbl_paddr);
 	printf("Queues allocated.\n");
 
-	/* buf = spdk_dma_zmalloc(0x1000, 0x1000, NULL); */
-	/* if (buf == NULL) { */
-	/* 	fprintf(stderr, "ERROR: write buffer allocation failed\n"); */
-	/* 	goto buf_alloc_fail; */
-	/* } */
-
-	/* snprintf(buf, 0x1000, "%s", DATA_BUFFER_STRING); */
-
-	// Write test string to the NVMe
-	/* rc = submit_rw_request(0, g_namespace.sw_qpair, buf); */
-	/* if (rc) { */
-	/* 	fprintf(stderr, "ERROR: Failed to submit RW request!\n"); */
-	/* 	goto buf_alloc_fail; */
-	/* } */
-
-	/* Read test string from NVMe and write it to the FPGA */
-	/* for (int it = 0; it < 1000; it++) { */
-	/* rc = submit_rw_request(1, g_namespace.sw_qpair, ctx.data_bar_vaddr); */
-	/* if (rc) { */
-	/* 	fprintf(stderr, "ERROR: Failed to submit RW request!\n"); */
-	/* 	goto buf_alloc_fail; */
-	/* } */
-	/* } */
-
 	rc = dma_ctrl_init(&ctx, &dma_ctx);
 	if (rc) {
 		fprintf(stderr, "Error configuring the DMA Iuventus controller structure\n");
@@ -1581,7 +1494,6 @@ main(int argc, char **argv)
 		rc = 0;
 	}
 
-	// Can be commented out if we want to keep statistics between runs
 	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_RPT_UPD_EN | CTRL_ENABLE);
 	usleep(1);
 
@@ -1591,7 +1503,6 @@ main(int argc, char **argv)
 	printf("Initialization complete. Starting main loop.\n");
 
 	usleep(1000);
-	//spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
 
 	/*
 	 * Main loop: poll every tracked SPDK thread so that ublk requests
@@ -1623,14 +1534,12 @@ main(int argc, char **argv)
 
 	rd_ctrl_regs(g_namespace.ctrlr);
 
-/* buf_alloc_fail: */
 dma_ctrl_alloc_fail:
 	queues_dealloc(&ctx);
 	printf("Qeues dealloced\n");
 queue_alloc_fail:
 	spdk_pci_device_detach(ctx.dev);
 	printf("Pcie dev detached\n");
-	/* fflush(stdout); */
 dma_dev_init_fail:
 	nfb_close(dma_ctx.dev);
 ctrlr_reset_fail:
