@@ -1168,6 +1168,19 @@ static void prp_list_free(struct ncd_probe_ctx *ncd_ctx)
 	spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
 }
 
+static void prp_list_print(struct ncd_probe_ctx *ncd_ctx)
+{
+	printf("Write PRP List (vaddr: %p, paddr: 0x%lx):\n", ncd_ctx->wrbuff_prp_list_vaddr, ncd_ctx->wrbuff_prp_list_paddr);
+	for (int i = 0; i < (int)(ncd_ctx->wrbuff_byte_size / VALUE_4KB)-1; i++) {
+		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)ncd_ctx->wrbuff_prp_list_vaddr)[i]);
+	}
+
+	printf("Read PRP List (vaddr: %p, paddr: 0x%lx):\n", ncd_ctx->rdbuff_prp_list_vaddr, ncd_ctx->rdbuff_prp_list_paddr);
+	for (int i = 0; i < (int)(ncd_ctx->rdbuff_byte_size / VALUE_4KB)-1; i++) {
+		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)ncd_ctx->rdbuff_prp_list_vaddr)[i]);
+	}
+}
+
 static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
 {
 	int rc = 0;
@@ -1544,6 +1557,8 @@ main(int argc, char **argv)
 		fprintf(stderr, "Error configuring the DMA Iuventus controller structure\n");
 		goto dma_ctrl_alloc_fail;
 	}
+
+	prp_list_print(&ctx);
 
 	/*
 	 * Initialise the host-side filesystem path.  This registers a thin
