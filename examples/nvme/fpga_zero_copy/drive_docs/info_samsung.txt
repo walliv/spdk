@@ -1,0 +1,310 @@
+=====================================================
+NVMe Controller at 0000:62:00.0 [144d:a80c]
+=====================================================
+Controller Capabilities/Features
+================================
+Vendor ID:                             144d
+Subsystem Vendor ID:                   144d
+Serial Number:                         S7DSNJ0WC16826X
+Model Number:                          Samsung SSD 990 PRO with Heatsink 4TB
+Firmware Version:                      0B2QJXG7
+Recommended Arb Burst:                 2
+IEEE OUI Identifier:                   38 25 00
+Multi-path I/O
+  May have multiple subsystem ports:   No
+  May have multiple controllers:       No
+  Associated with SR-IOV VF:           No
+Max Data Transfer Size:                2097152
+Max Number of Namespaces:              1
+Max Number of I/O Queues:              16
+NVMe Specification Version (VS):       2.0
+NVMe Specification Version (Identify): 2.0
+Maximum Queue Entries:                 16384
+Contiguous Queues Required:            Yes
+Arbitration Mechanisms Supported
+  Weighted Round Robin:                Supported
+  Vendor Specific:                     Not Supported
+Reset Timeout:                         20000 ms
+Doorbell Stride:                       4 bytes
+NVM Subsystem Reset:                   Supported
+Command Sets Supported
+  NVM Command Set:                     Supported
+Boot Partition:                        Not Supported
+Memory Page Size Minimum:              4096 bytes
+Memory Page Size Maximum:              4096 bytes
+Persistent Memory Region:              Not Supported
+Optional Asynchronous Events Supported
+  Namespace Attribute Notices:         Not Supported
+  Firmware Activation Notices:         Supported
+  ANA Change Notices:                  Not Supported
+  PLE Aggregate Log Change Notices:    Not Supported
+  LBA Status Info Alert Notices:       Not Supported
+  EGE Aggregate Log Change Notices:    Not Supported
+  Normal NVM Subsystem Shutdown event: Not Supported
+  Zone Descriptor Change Notices:      Not Supported
+  Discovery Log Change Notices:        Not Supported
+Controller Attributes
+  128-bit Host Identifier:             Not Supported
+  Non-Operational Permissive Mode:     Not Supported
+  NVM Sets:                            Not Supported
+  Read Recovery Levels:                Not Supported
+  Endurance Groups:                    Supported
+  Predictable Latency Mode:            Not Supported
+  Traffic Based Keep ALive:            Not Supported
+  Namespace Granularity:               Not Supported
+  SQ Associations:                     Not Supported
+  UUID List:                           Not Supported
+  Multi-Domain Subsystem:              Not Supported
+  Fixed Capacity Management:           Not Supported
+  Variable Capacity Management:        Not Supported
+  Delete Endurance Group:              Not Supported
+  Delete NVM Set:                      Not Supported
+  Extended LBA Formats Supported:      Not Supported
+  Flexible Data Placement Supported:   Not Supported
+
+Controller Memory Buffer Support
+================================
+Supported:                             No
+
+Persistent Memory Region Support
+================================
+Supported:                             No
+
+Admin Command Set Attributes
+============================
+Security Send/Receive:                 Supported
+Format NVM:                            Supported
+Firmware Activate/Download:            Supported
+Namespace Management:                  Not Supported
+Device Self-Test:                      Supported
+Directives:                            Not Supported
+NVMe-MI:                               Not Supported
+Virtualization Management:             Not Supported
+Doorbell Buffer Config:                Not Supported
+Get LBA Status Capability:             Not Supported
+Command & Feature Lockdown Capability: Not Supported
+Abort Command Limit:                   8
+Async Event Request Limit:             4
+Number of Firmware Slots:              3
+Firmware Slot 1 Read-Only:             No
+Firmware Activation Without Reset:     Yes
+Multiple Update Detection Support:     No
+Firmware Update Granularity:           No Information Provided
+Per-Namespace SMART Log:               Yes
+Asymmetric Namespace Access Log Page:  Not Supported
+Subsystem NQN:                         nqn.1994-11.com.samsung:nvme:990PRO:M.2:S7DSNJ0WC16826X     
+Command Effects Log Page:              Supported
+Get Log Page Extended Data:            Supported
+Telemetry Log Pages:                   Supported
+Persistent Event Log Pages:            Not Supported
+Supported Log Pages Log Page:          Supported
+Commands Supported & Effects Log Page: Supported
+Feature Identifiers & Effects Log Page:Supported
+NVMe-MI Commands & Effects Log Page:   Supported
+Data Area 4 for Telemetry Log:         Not Supported
+Error Log Page Entries Supported:      64
+Keep Alive:                            Not Supported
+
+NVM Command Set Attributes
+==========================
+Submission Queue Entry Size
+  Max:                       64
+  Min:                       64
+Completion Queue Entry Size
+  Max:                       16
+  Min:                       16
+Number of Namespaces:        1
+Compare Command:             Supported
+Write Uncorrectable Command: Not Supported
+Dataset Management Command:  Supported
+Write Zeroes Command:        Not Supported
+Set Features Save Field:     Supported
+Reservations:                Not Supported
+Timestamp:                   Supported
+Copy:                        Not Supported
+Volatile Write Cache:        Present
+Atomic Write Unit (Normal):  1024
+Atomic Write Unit (PFail):   1
+Atomic Compare & Write Unit: 1
+Fused Compare & Write:       Not Supported
+Scatter-Gather List
+  SGL Command Set:           Not Supported
+  SGL Keyed:                 Not Supported
+  SGL Bit Bucket Descriptor: Not Supported
+  SGL Metadata Pointer:      Not Supported
+  Oversized SGL:             Not Supported
+  SGL Metadata Address:      Not Supported
+  SGL Offset:                Not Supported
+  Transport SGL Data Block:  Not Supported
+Replay Protected Memory Block:  Not Supported
+
+Firmware Slot Information
+=========================
+Active slot:                 1
+Slot 1 Firmware Revision:    0B2QJXG7
+
+
+Commands Supported and Effects
+==============================
+Admin Commands
+--------------
+   Delete I/O Submission Queue (00h): Supported 
+   Create I/O Submission Queue (01h): Supported 
+                  Get Log Page (02h): Supported 
+   Delete I/O Completion Queue (04h): Supported 
+   Create I/O Completion Queue (05h): Supported 
+                      Identify (06h): Supported 
+                         Abort (08h): Supported 
+                  Set Features (09h): Supported 
+                  Get Features (0Ah): Supported 
+    Asynchronous Event Request (0Ch): Supported 
+               Firmware Commit (10h): Supported 
+       Firmware Image Download (11h): Supported 
+              Device Self-test (14h): Supported 
+                    Format NVM (80h): Supported LBA-Change All-NS-Exclusive
+                 Security Send (81h): Supported LBA-Change All-NS-Exclusive
+              Security Receive (82h): Supported Per-NS-Exclusive
+                      Sanitize (84h): Supported LBA-Change All-NS-Exclusive
+I/O Commands
+------------
+                         Flush (00h): Supported Per-NS-Exclusive
+                         Write (01h): Supported LBA-Change 
+                          Read (02h): Supported 
+                       Compare (05h): Supported 
+            Dataset Management (09h): Supported LBA-Change All-NS-Exclusive
+
+Error Log
+=========
+
+Arbitration
+===========
+Arbitration Burst:           4
+Low Priority Weight:         4
+Medium Priority Weight:      4
+High Priority Weight:        4
+
+Power Management
+================
+Number of Power States:          5
+Current Power State:             Power State #0
+Power State #0:
+  Max Power:                      9.39 W
+  Non-Operational State:         Operational
+  Entry Latency:                 Not Reported
+  Exit Latency:                  Not Reported
+  Relative Read Throughput:      0
+  Relative Read Latency:         0
+  Relative Write Throughput:     0
+  Relative Write Latency:        0
+  Idle Power:                     Not Reported
+  Active Power:                   Not Reported
+Power State #1:
+  Max Power:                      9.39 W
+  Non-Operational State:         Operational
+  Entry Latency:                 Not Reported
+  Exit Latency:                  Not Reported
+  Relative Read Throughput:      1
+  Relative Read Latency:         1
+  Relative Write Throughput:     1
+  Relative Write Latency:        1
+  Idle Power:                     Not Reported
+  Active Power:                   Not Reported
+Power State #2:
+  Max Power:                      9.39 W
+  Non-Operational State:         Operational
+  Entry Latency:                 Not Reported
+  Exit Latency:                  Not Reported
+  Relative Read Throughput:      2
+  Relative Read Latency:         2
+  Relative Write Throughput:     2
+  Relative Write Latency:        2
+  Idle Power:                     Not Reported
+  Active Power:                   Not Reported
+Power State #3:
+  Max Power:                    0.0400 W
+  Non-Operational State:         Non-Operation
+  Entry Latency:                 4200 microseconds
+  Exit Latency:                  2700 microseconds
+  Relative Read Throughput:      3
+  Relative Read Latency:         3
+  Relative Write Throughput:     3
+  Relative Write Latency:        3
+  Idle Power:                     Not Reported
+  Active Power:                   Not Reported
+Power State #4:
+  Max Power:                    0.0050 W
+  Non-Operational State:         Non-Operation
+  Entry Latency:                 500 microseconds
+  Exit Latency:                  21800 microseconds
+  Relative Read Throughput:      4
+  Relative Read Latency:         4
+  Relative Write Throughput:     4
+  Relative Write Latency:        4
+  Idle Power:                     Not Reported
+  Active Power:                   Not Reported
+Non-Operational Permissive Mode: Not Supported
+
+Health Information
+==================
+Critical Warnings:
+  Available Spare Space:     OK
+  Temperature:               OK
+  Device Reliability:        OK
+  Read Only:                 No
+  Volatile Memory Backup:    OK
+Current Temperature:         324 Kelvin (51 Celsius)
+Temperature Threshold:       355 Kelvin (82 Celsius)
+Available Spare:             100%
+Available Spare Threshold:   10%
+Life Percentage Used:        0%
+Data Units Read:             8916331
+Data Units Written:          3386308
+Host Read Commands:          1220184351
+Host Write Commands:         3338648
+Controller Busy Time:        49 minutes
+Power Cycles:                42
+Power On Hours:              949 hours
+Unsafe Shutdowns:            10
+Unrecoverable Media Errors:  0
+Lifetime Error Log Entries:  128946
+Warning Temperature Time:    0 minutes
+Critical Temperature Time:   0 minutes
+Temperature Sensor 1:        324 Kelvin (51 Celsius)
+Temperature Sensor 2:        336 Kelvin (63 Celsius)
+
+Number of Queues
+================
+Number of I/O Submission Queues:      16
+Number of I/O Completion Queues:      16
+
+Host Controlled Thermal Management
+==================================
+Minimum Thermal Management Temperature:  318 Kelvin (45 Celsius)
+Maximum Thermal Management Temperature:   356 Kelvin (83 Celsius)
+
+Active Namespaces
+=================
+Namespace ID:1
+Error Recovery Timeout:                Unlimited
+Command Set Identifier:                NVM (00h)
+Deallocate:                            Supported
+Deallocated/Unwritten Error:           Not Supported
+Deallocated Read Value:                All 0x00
+Deallocate in Write Zeroes:            Not Supported
+Deallocated Guard Field:               0xFFFF
+Flush:                                 Supported
+Reservation:                           Not Supported
+Namespace Sharing Capabilities:        Private
+Size (in LBAs):                        7814037168 (3726GiB)
+Capacity (in LBAs):                    7814037168 (3726GiB)
+Utilization (in LBAs):                 0 (0GiB)
+EUI64:                                 0025384C3144A774
+Thin Provisioning:                     Not Supported
+Per-NS Atomic Units:                   No
+NGUID/EUI64 Never Reused:              No
+Namespace Write Protected:             No
+Endurance group ID:                    1
+Number of LBA Formats:                 1
+Current LBA Format:                    LBA Format #00
+LBA Format #00: Data Size:   512  Metadata Size:     0
+

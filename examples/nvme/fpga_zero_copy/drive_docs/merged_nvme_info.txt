@@ -1,0 +1,1168 @@
+Attributes rendered: 225
+Attributes with DIFF: 100
+Mode: all
+
+Merged NVMe Context Report
+==========================
+Generated: 2026-03-13T15:39:40
+
+Input files:
+- info_intel.txt
+- info_skhynx.txt
+- info_samsung.txt
+
+Controllers:
+1. 0000:2d:00.0 [8086:f1a5] | INTEL SSDPEKKW256G7
+2. 0000:61:00.0 [1c5c:1639] | PC611 NVMe SK hynix 512GB
+3. 0000:62:00.0 [144d:a80c] | Samsung SSD 990 PRO with Heatsink 4TB
+
+Active Namespaces
+-----------------
+* Capacity (in LBAs) [DIFF]
+    - INTEL SSDPEKKW256G7                   : 500118192 (238GiB)
+    - PC611 NVMe SK hynix 512GB             : 1000215216 (476GiB)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 7814037168 (3726GiB)
+
+* Command Set Identifier [SAME]
+    - INTEL SSDPEKKW256G7                   : NVM (00h)
+    - PC611 NVMe SK hynix 512GB             : NVM (00h)
+    - Samsung SSD 990 PRO with Heatsink 4TB : NVM (00h)
+
+* Current LBA Format [SAME]
+    - INTEL SSDPEKKW256G7                   : LBA Format #00
+    - PC611 NVMe SK hynix 512GB             : LBA Format #00
+    - Samsung SSD 990 PRO with Heatsink 4TB : LBA Format #00
+
+* Deallocate [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Deallocate in Write Zeroes [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Deallocated Guard Field [SAME]
+    - INTEL SSDPEKKW256G7                   : 0xFFFF
+    - PC611 NVMe SK hynix 512GB             : 0xFFFF
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0xFFFF
+
+* Deallocated Read Value [DIFF]
+    - INTEL SSDPEKKW256G7                   : Unknown
+    - PC611 NVMe SK hynix 512GB             : Unknown
+    - Samsung SSD 990 PRO with Heatsink 4TB : All 0x00
+
+* Deallocated/Unwritten Error [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* EUI64 [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : ACE42E000A7D99A0
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0025384C3144A774
+
+* Endurance group ID [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1
+
+* Error Recovery Timeout [SAME]
+    - INTEL SSDPEKKW256G7                   : Unlimited
+    - PC611 NVMe SK hynix 512GB             : Unlimited
+    - Samsung SSD 990 PRO with Heatsink 4TB : Unlimited
+
+* Flush [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* LBA Format #00 [SAME]
+    - INTEL SSDPEKKW256G7                   : Data Size:   512  Metadata Size:     0
+    - PC611 NVMe SK hynix 512GB             : Data Size:   512  Metadata Size:     0
+    - Samsung SSD 990 PRO with Heatsink 4TB : Data Size:   512  Metadata Size:     0
+
+* LBA Format #01 [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : Data Size:  4096  Metadata Size:     0
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* NGUID [DIFF]
+    - INTEL SSDPEKKW256G7                   : 0000000001000000E4D25C0A5DC34E01
+    - PC611 NVMe SK hynix 512GB             : ACE42E000A7D99A02EE4AC0000000001
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* NGUID/EUI64 Never Reused [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* Namespace ID [SAME]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 1
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1
+
+* Namespace Sharing Capabilities [SAME]
+    - INTEL SSDPEKKW256G7                   : Private
+    - PC611 NVMe SK hynix 512GB             : Private
+    - Samsung SSD 990 PRO with Heatsink 4TB : Private
+
+* Namespace Write Protected [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* Number of LBA Formats [DIFF]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 2
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1
+
+* Per-NS Atomic Units [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* Reservation [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Size (in LBAs) [DIFF]
+    - INTEL SSDPEKKW256G7                   : 500118192 (238GiB)
+    - PC611 NVMe SK hynix 512GB             : 1000215216 (476GiB)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 7814037168 (3726GiB)
+
+* Thin Provisioning [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Utilization (in LBAs) [DIFF]
+    - INTEL SSDPEKKW256G7                   : 500118192 (238GiB)
+    - PC611 NVMe SK hynix 512GB             : 1000215216 (476GiB)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0 (0GiB)
+
+Admin Command Set Attributes
+----------------------------
+* Abort Command Limit [DIFF]
+    - INTEL SSDPEKKW256G7                   : 5
+    - PC611 NVMe SK hynix 512GB             : 4
+    - Samsung SSD 990 PRO with Heatsink 4TB : 8
+
+* Asymmetric Namespace Access Log Page [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Async Event Request Limit [DIFF]
+    - INTEL SSDPEKKW256G7                   : 8
+    - PC611 NVMe SK hynix 512GB             : 8
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
+
+* Command & Feature Lockdown Capability [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Command Effects Log Page [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Commands Supported & Effects Log Page [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Data Area 4 for Telemetry Log [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Device Self-Test [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Directives [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Doorbell Buffer Config [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Error Log Page Entries Supported [DIFF]
+    - INTEL SSDPEKKW256G7                   : 64
+    - PC611 NVMe SK hynix 512GB             : 256
+    - Samsung SSD 990 PRO with Heatsink 4TB : 64
+
+* Feature Identifiers & Effects Log Page [DIFF]
+    - INTEL SSDPEKKW256G7                   : May Support
+    - PC611 NVMe SK hynix 512GB             : May Support
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Firmware Activate/Download [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Firmware Activation Without Reset [SAME]
+    - INTEL SSDPEKKW256G7                   : Yes
+    - PC611 NVMe SK hynix 512GB             : Yes
+    - Samsung SSD 990 PRO with Heatsink 4TB : Yes
+
+* Firmware Slot 1 Read-Only [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* Firmware Update Granularity [DIFF]
+    - INTEL SSDPEKKW256G7                   : 4 KiB
+    - PC611 NVMe SK hynix 512GB             : No Information Provided
+    - Samsung SSD 990 PRO with Heatsink 4TB : No Information Provided
+
+* Format NVM [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Get LBA Status Capability [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Get Log Page Extended Data [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Keep Alive [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Multiple Update Detection Support [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* NVMe-MI [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* NVMe-MI Commands & Effects Log Page [DIFF]
+    - INTEL SSDPEKKW256G7                   : May Support
+    - PC611 NVMe SK hynix 512GB             : May Support
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Namespace Management [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Number of Firmware Slots [DIFF]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 3
+    - Samsung SSD 990 PRO with Heatsink 4TB : 3
+
+* Per-Namespace SMART Log [DIFF]
+    - INTEL SSDPEKKW256G7                   : Yes
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : Yes
+
+* Persistent Event Log Pages [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Security Send/Receive [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Subsystem NQN [DIFF]
+    - INTEL SSDPEKKW256G7                   : <empty>
+    - PC611 NVMe SK hynix 512GB             : <empty>
+    - Samsung SSD 990 PRO with Heatsink 4TB : nqn.1994-11.com.samsung:nvme:990PRO:M.2:S7DSNJ0WC16826X
+
+* Supported Log Pages Log Page [DIFF]
+    - INTEL SSDPEKKW256G7                   : May Support
+    - PC611 NVMe SK hynix 512GB             : May Support
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Telemetry Log Pages [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Virtualization Management [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+Arbitration
+-----------
+* Arbitration Burst [DIFF]
+    - INTEL SSDPEKKW256G7                   : 64
+    - PC611 NVMe SK hynix 512GB             : 4
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
+
+* High Priority Weight [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
+
+* Low Priority Weight [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
+
+* Medium Priority Weight [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
+
+Commands Supported and Effects
+------------------------------
+* ------------ / Compare (05h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* ------------ / Dataset Management (09h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change
+    - PC611 NVMe SK hynix 512GB             : Supported LBA-Change
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported LBA-Change All-NS-Exclusive
+
+* ------------ / Flush (00h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported Per-NS-Exclusive
+
+* ------------ / Read (02h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* ------------ / Write (01h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change
+    - PC611 NVMe SK hynix 512GB             : Supported LBA-Change
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported LBA-Change
+
+* ------------ / Write Uncorrectable (04h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change
+    - PC611 NVMe SK hynix 512GB             : Supported LBA-Change
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* ------------ / Write Zeroes (08h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change
+    - PC611 NVMe SK hynix 512GB             : Supported LBA-Change
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Abort (08h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Asynchronous Event Request (0Ch) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Create I/O Completion Queue (05h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Create I/O Submission Queue (01h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Delete I/O Completion Queue (04h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Delete I/O Submission Queue (00h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Device Self-test (14h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Firmware Commit (10h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported Ctrlr-Cap-Change
+    - PC611 NVMe SK hynix 512GB             : Supported Ctrlr-Cap-Change All-NS-Exclusive
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Firmware Image Download (11h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Format NVM (80h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change Per-NS-Exclusive
+    - PC611 NVMe SK hynix 512GB             : Supported LBA-Change NS-Cap-Change Per-NS-Exclusive
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported LBA-Change All-NS-Exclusive
+
+* -------------- / Get Features (0Ah) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Get Log Page (02h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Identify (06h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Sanitize (84h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : Supported LBA-Change All-NS-Exclusive
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported LBA-Change All-NS-Exclusive
+
+* -------------- / Security Receive (82h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported Per-NS-Exclusive
+
+* -------------- / Security Send (81h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported LBA-Change All-NS-Exclusive
+
+* -------------- / Set Features (09h) [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* -------------- / Vendor specific (C0h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change NS-Cap-Change Ctrlr-Cap-Change
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Vendor specific (C1h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change NS-Cap-Change Ctrlr-Cap-Change
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Vendor specific (C2h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Vendor specific (D1h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported LBA-Change
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Vendor specific (D2h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Vendor specific (E0h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : <missing>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Vendor specific (F0h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Vendor specific (F1h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+* -------------- / Vendor specific (F2h) [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : <missing>
+
+Controller Capabilities/Features
+--------------------------------
+* Arbitration Mechanisms Supported / Vendor Specific [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Arbitration Mechanisms Supported / Weighted Round Robin [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Boot Partition [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Command Sets Supported / NVM Command Set [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Contiguous Queues Required [SAME]
+    - INTEL SSDPEKKW256G7                   : Yes
+    - PC611 NVMe SK hynix 512GB             : Yes
+    - Samsung SSD 990 PRO with Heatsink 4TB : Yes
+
+* Controller Attributes / 128-bit Host Identifier [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Delete Endurance Group [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Delete NVM Set [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Endurance Groups [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Controller Attributes / Extended LBA Formats Supported [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Fixed Capacity Management [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Flexible Data Placement Supported [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Multi-Domain Subsystem [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / NVM Sets [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Namespace Granularity [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Non-Operational Permissive Mode [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Predictable Latency Mode [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Read Recovery Levels [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / SQ Associations [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Traffic Based Keep ALive [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / UUID List [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Controller Attributes / Variable Capacity Management [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Doorbell Stride [SAME]
+    - INTEL SSDPEKKW256G7                   : 4 bytes
+    - PC611 NVMe SK hynix 512GB             : 4 bytes
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4 bytes
+
+* Firmware Version [DIFF]
+    - INTEL SSDPEKKW256G7                   : PSF121C
+    - PC611 NVMe SK hynix 512GB             : 11001111
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0B2QJXG7
+
+* IEEE OUI Identifier [DIFF]
+    - INTEL SSDPEKKW256G7                   : e4 d2 5c
+    - PC611 NVMe SK hynix 512GB             : 2e e4 ac
+    - Samsung SSD 990 PRO with Heatsink 4TB : 38 25 00
+
+* Max Data Transfer Size [DIFF]
+    - INTEL SSDPEKKW256G7                   : 131072
+    - PC611 NVMe SK hynix 512GB             : 262144
+    - Samsung SSD 990 PRO with Heatsink 4TB : 2097152
+
+* Max Number of I/O Queues [DIFF]
+    - INTEL SSDPEKKW256G7                   : 8
+    - PC611 NVMe SK hynix 512GB             : 16
+    - Samsung SSD 990 PRO with Heatsink 4TB : 16
+
+* Max Number of Namespaces [SAME]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 1
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1
+
+* Maximum Queue Entries [DIFF]
+    - INTEL SSDPEKKW256G7                   : 256
+    - PC611 NVMe SK hynix 512GB             : 1024
+    - Samsung SSD 990 PRO with Heatsink 4TB : 16384
+
+* Memory Page Size Maximum [DIFF]
+    - INTEL SSDPEKKW256G7                   : 8192 bytes
+    - PC611 NVMe SK hynix 512GB             : 4096 bytes
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4096 bytes
+
+* Memory Page Size Minimum [SAME]
+    - INTEL SSDPEKKW256G7                   : 4096 bytes
+    - PC611 NVMe SK hynix 512GB             : 4096 bytes
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4096 bytes
+
+* Model Number [DIFF]
+    - INTEL SSDPEKKW256G7                   : INTEL SSDPEKKW256G7
+    - PC611 NVMe SK hynix 512GB             : PC611 NVMe SK hynix 512GB
+    - Samsung SSD 990 PRO with Heatsink 4TB : Samsung SSD 990 PRO with Heatsink 4TB
+
+* Multi-path I/O / Associated with SR-IOV VF [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* Multi-path I/O / May have multiple controllers [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* Multi-path I/O / May have multiple subsystem ports [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* NVM Subsystem Reset [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* NVMe Specification Version (Identify) [DIFF]
+    - INTEL SSDPEKKW256G7                   : 1.2
+    - PC611 NVMe SK hynix 512GB             : 1.3
+    - Samsung SSD 990 PRO with Heatsink 4TB : 2.0
+
+* NVMe Specification Version (VS) [DIFF]
+    - INTEL SSDPEKKW256G7                   : 1.2
+    - PC611 NVMe SK hynix 512GB             : 1.3
+    - Samsung SSD 990 PRO with Heatsink 4TB : 2.0
+
+* Optional Asynchronous Events Supported / ANA Change Notices [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Optional Asynchronous Events Supported / Discovery Log Change Notices [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Optional Asynchronous Events Supported / EGE Aggregate Log Change Notices [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Optional Asynchronous Events Supported / Firmware Activation Notices [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Optional Asynchronous Events Supported / LBA Status Info Alert Notices [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Optional Asynchronous Events Supported / Namespace Attribute Notices [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Optional Asynchronous Events Supported / Normal NVM Subsystem Shutdown event [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Optional Asynchronous Events Supported / PLE Aggregate Log Change Notices [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Optional Asynchronous Events Supported / Zone Descriptor Change Notices [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Persistent Memory Region [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Recommended Arb Burst [DIFF]
+    - INTEL SSDPEKKW256G7                   : 6
+    - PC611 NVMe SK hynix 512GB             : 4
+    - Samsung SSD 990 PRO with Heatsink 4TB : 2
+
+* Reset Timeout [DIFF]
+    - INTEL SSDPEKKW256G7                   : 60000 ms
+    - PC611 NVMe SK hynix 512GB             : 10000 ms
+    - Samsung SSD 990 PRO with Heatsink 4TB : 20000 ms
+
+* Serial Number [DIFF]
+    - INTEL SSDPEKKW256G7                   : BTPY74120KM7256D
+    - PC611 NVMe SK hynix 512GB             : NY09N01061100982I
+    - Samsung SSD 990 PRO with Heatsink 4TB : S7DSNJ0WC16826X
+
+* Subsystem Vendor ID [DIFF]
+    - INTEL SSDPEKKW256G7                   : 8086
+    - PC611 NVMe SK hynix 512GB             : 1c5c
+    - Samsung SSD 990 PRO with Heatsink 4TB : 144d
+
+* Vendor ID [DIFF]
+    - INTEL SSDPEKKW256G7                   : 8086
+    - PC611 NVMe SK hynix 512GB             : 1c5c
+    - Samsung SSD 990 PRO with Heatsink 4TB : 144d
+
+Controller Memory Buffer Support
+--------------------------------
+* Supported [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+Firmware Slot Information
+-------------------------
+* Active slot [SAME]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 1
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1
+
+* Slot 1 Firmware Revision [DIFF]
+    - INTEL SSDPEKKW256G7                   : PSF121C
+    - PC611 NVMe SK hynix 512GB             : 11001111
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0B2QJXG7
+
+Health Information
+------------------
+* Available Spare [DIFF]
+    - INTEL SSDPEKKW256G7                   : 95%
+    - PC611 NVMe SK hynix 512GB             : 100%
+    - Samsung SSD 990 PRO with Heatsink 4TB : 100%
+
+* Available Spare Space [SAME]
+    - INTEL SSDPEKKW256G7                   : OK
+    - PC611 NVMe SK hynix 512GB             : OK
+    - Samsung SSD 990 PRO with Heatsink 4TB : OK
+
+* Available Spare Threshold [DIFF]
+    - INTEL SSDPEKKW256G7                   : 10%
+    - PC611 NVMe SK hynix 512GB             : 50%
+    - Samsung SSD 990 PRO with Heatsink 4TB : 10%
+
+* Controller Busy Time [DIFF]
+    - INTEL SSDPEKKW256G7                   : 13606 minutes
+    - PC611 NVMe SK hynix 512GB             : 5602 minutes
+    - Samsung SSD 990 PRO with Heatsink 4TB : 49 minutes
+
+* Critical Temperature Time [SAME]
+    - INTEL SSDPEKKW256G7                   : 0 minutes
+    - PC611 NVMe SK hynix 512GB             : 0 minutes
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0 minutes
+
+* Critical Warnings [SAME]
+    - INTEL SSDPEKKW256G7                   : <empty>
+    - PC611 NVMe SK hynix 512GB             : <empty>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <empty>
+
+* Current Temperature [DIFF]
+    - INTEL SSDPEKKW256G7                   : 303 Kelvin (30 Celsius)
+    - PC611 NVMe SK hynix 512GB             : 336 Kelvin (63 Celsius)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 324 Kelvin (51 Celsius)
+
+* Data Units Read [DIFF]
+    - INTEL SSDPEKKW256G7                   : 70940246
+    - PC611 NVMe SK hynix 512GB             : 47839820
+    - Samsung SSD 990 PRO with Heatsink 4TB : 8916331
+
+* Data Units Written [DIFF]
+    - INTEL SSDPEKKW256G7                   : 42037056
+    - PC611 NVMe SK hynix 512GB             : 30906167
+    - Samsung SSD 990 PRO with Heatsink 4TB : 3386308
+
+* Device Reliability [SAME]
+    - INTEL SSDPEKKW256G7                   : OK
+    - PC611 NVMe SK hynix 512GB             : OK
+    - Samsung SSD 990 PRO with Heatsink 4TB : OK
+
+* Host Read Commands [DIFF]
+    - INTEL SSDPEKKW256G7                   : 1302977480
+    - PC611 NVMe SK hynix 512GB             : 2258724656
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1220184351
+
+* Host Write Commands [DIFF]
+    - INTEL SSDPEKKW256G7                   : 711060256
+    - PC611 NVMe SK hynix 512GB             : 582078460
+    - Samsung SSD 990 PRO with Heatsink 4TB : 3338648
+
+* Life Percentage Used [DIFF]
+    - INTEL SSDPEKKW256G7                   : 10%
+    - PC611 NVMe SK hynix 512GB             : 0%
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0%
+
+* Lifetime Error Log Entries [DIFF]
+    - INTEL SSDPEKKW256G7                   : 1393756
+    - PC611 NVMe SK hynix 512GB             : 298759
+    - Samsung SSD 990 PRO with Heatsink 4TB : 128946
+
+* Power Cycles [DIFF]
+    - INTEL SSDPEKKW256G7                   : 6528
+    - PC611 NVMe SK hynix 512GB             : 3524
+    - Samsung SSD 990 PRO with Heatsink 4TB : 42
+
+* Power On Hours [DIFF]
+    - INTEL SSDPEKKW256G7                   : 93922 hours
+    - PC611 NVMe SK hynix 512GB             : 12118 hours
+    - Samsung SSD 990 PRO with Heatsink 4TB : 949 hours
+
+* Read Only [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+* Temperature [SAME]
+    - INTEL SSDPEKKW256G7                   : OK
+    - PC611 NVMe SK hynix 512GB             : OK
+    - Samsung SSD 990 PRO with Heatsink 4TB : OK
+
+* Temperature Sensor 1 [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : 329 Kelvin (56 Celsius)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 324 Kelvin (51 Celsius)
+
+* Temperature Sensor 2 [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : 360 Kelvin (87 Celsius)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 336 Kelvin (63 Celsius)
+
+* Temperature Threshold [DIFF]
+    - INTEL SSDPEKKW256G7                   : 343 Kelvin (70 Celsius)
+    - PC611 NVMe SK hynix 512GB             : 356 Kelvin (83 Celsius)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 355 Kelvin (82 Celsius)
+
+* Unrecoverable Media Errors [DIFF]
+    - INTEL SSDPEKKW256G7                   : 4
+    - PC611 NVMe SK hynix 512GB             : 0
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0
+
+* Unsafe Shutdowns [DIFF]
+    - INTEL SSDPEKKW256G7                   : 1823
+    - PC611 NVMe SK hynix 512GB             : 1921
+    - Samsung SSD 990 PRO with Heatsink 4TB : 10
+
+* Volatile Memory Backup [SAME]
+    - INTEL SSDPEKKW256G7                   : OK
+    - PC611 NVMe SK hynix 512GB             : OK
+    - Samsung SSD 990 PRO with Heatsink 4TB : OK
+
+* Warning Temperature Time [DIFF]
+    - INTEL SSDPEKKW256G7                   : 71 minutes
+    - PC611 NVMe SK hynix 512GB             : 0 minutes
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0 minutes
+
+Host Controlled Thermal Management
+----------------------------------
+* Maximum Thermal Management Temperature [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : 356 Kelvin (83 Celsius)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 356 Kelvin (83 Celsius)
+
+* Minimum Thermal Management Temperature [DIFF]
+    - INTEL SSDPEKKW256G7                   : <missing>
+    - PC611 NVMe SK hynix 512GB             : 273 Kelvin (0 Celsius)
+    - Samsung SSD 990 PRO with Heatsink 4TB : 318 Kelvin (45 Celsius)
+
+NVM Command Set Attributes
+--------------------------
+* Atomic Compare & Write Unit [SAME]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 1
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1
+
+* Atomic Write Unit (Normal) [DIFF]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 1
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1024
+
+* Atomic Write Unit (PFail) [SAME]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 1
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1
+
+* Compare Command [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Completion Queue Entry Size / Max [SAME]
+    - INTEL SSDPEKKW256G7                   : 16
+    - PC611 NVMe SK hynix 512GB             : 16
+    - Samsung SSD 990 PRO with Heatsink 4TB : 16
+
+* Completion Queue Entry Size / Min [SAME]
+    - INTEL SSDPEKKW256G7                   : 16
+    - PC611 NVMe SK hynix 512GB             : 16
+    - Samsung SSD 990 PRO with Heatsink 4TB : 16
+
+* Copy [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Dataset Management Command [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Fused Compare & Write [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Number of Namespaces [SAME]
+    - INTEL SSDPEKKW256G7                   : 1
+    - PC611 NVMe SK hynix 512GB             : 1
+    - Samsung SSD 990 PRO with Heatsink 4TB : 1
+
+* Replay Protected Memory Block [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Reservations [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Scatter-Gather List / Oversized SGL [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Scatter-Gather List / SGL Bit Bucket Descriptor [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Scatter-Gather List / SGL Command Set [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Scatter-Gather List / SGL Keyed [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Scatter-Gather List / SGL Metadata Address [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Scatter-Gather List / SGL Metadata Pointer [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Scatter-Gather List / SGL Offset [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Scatter-Gather List / Transport SGL Data Block [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Set Features Save Field [SAME]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Submission Queue Entry Size / Max [SAME]
+    - INTEL SSDPEKKW256G7                   : 64
+    - PC611 NVMe SK hynix 512GB             : 64
+    - Samsung SSD 990 PRO with Heatsink 4TB : 64
+
+* Submission Queue Entry Size / Min [SAME]
+    - INTEL SSDPEKKW256G7                   : 64
+    - PC611 NVMe SK hynix 512GB             : 64
+    - Samsung SSD 990 PRO with Heatsink 4TB : 64
+
+* Timestamp [DIFF]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Supported
+
+* Volatile Write Cache [SAME]
+    - INTEL SSDPEKKW256G7                   : Present
+    - PC611 NVMe SK hynix 512GB             : Present
+    - Samsung SSD 990 PRO with Heatsink 4TB : Present
+
+* Write Uncorrectable Command [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Write Zeroes Command [DIFF]
+    - INTEL SSDPEKKW256G7                   : Supported
+    - PC611 NVMe SK hynix 512GB             : Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+Number of Queues
+----------------
+* Number of I/O Completion Queues [DIFF]
+    - INTEL SSDPEKKW256G7                   : 8
+    - PC611 NVMe SK hynix 512GB             : 16
+    - Samsung SSD 990 PRO with Heatsink 4TB : 16
+
+* Number of I/O Submission Queues [DIFF]
+    - INTEL SSDPEKKW256G7                   : 8
+    - PC611 NVMe SK hynix 512GB             : 16
+    - Samsung SSD 990 PRO with Heatsink 4TB : 16
+
+Persistent Memory Region Support
+--------------------------------
+* Supported [SAME]
+    - INTEL SSDPEKKW256G7                   : No
+    - PC611 NVMe SK hynix 512GB             : No
+    - Samsung SSD 990 PRO with Heatsink 4TB : No
+
+Power Management
+----------------
+* Active Power [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Reported
+    - PC611 NVMe SK hynix 512GB             : Not Reported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Reported
+
+* Current Power State [SAME]
+    - INTEL SSDPEKKW256G7                   : Power State #0
+    - PC611 NVMe SK hynix 512GB             : Power State #0
+    - Samsung SSD 990 PRO with Heatsink 4TB : Power State #0
+
+* Entry Latency [DIFF]
+    - INTEL SSDPEKKW256G7                   : 2000 microseconds
+    - PC611 NVMe SK hynix 512GB             : 1000 microseconds
+    - Samsung SSD 990 PRO with Heatsink 4TB : 500 microseconds
+
+* Exit Latency [DIFF]
+    - INTEL SSDPEKKW256G7                   : 10000 microseconds
+    - PC611 NVMe SK hynix 512GB             : 9000 microseconds
+    - Samsung SSD 990 PRO with Heatsink 4TB : 21800 microseconds
+
+* Idle Power [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Reported
+    - PC611 NVMe SK hynix 512GB             : Not Reported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Reported
+
+* Max Power [DIFF]
+    - INTEL SSDPEKKW256G7                   : 0.0050 W
+    - PC611 NVMe SK hynix 512GB             : 0.0040 W
+    - Samsung SSD 990 PRO with Heatsink 4TB : 0.0050 W
+
+* Non-Operational Permissive Mode [SAME]
+    - INTEL SSDPEKKW256G7                   : Not Supported
+    - PC611 NVMe SK hynix 512GB             : Not Supported
+    - Samsung SSD 990 PRO with Heatsink 4TB : Not Supported
+
+* Non-Operational State [SAME]
+    - INTEL SSDPEKKW256G7                   : Non-Operation
+    - PC611 NVMe SK hynix 512GB             : Non-Operation
+    - Samsung SSD 990 PRO with Heatsink 4TB : Non-Operation
+
+* Number of Power States [SAME]
+    - INTEL SSDPEKKW256G7                   : 5
+    - PC611 NVMe SK hynix 512GB             : 5
+    - Samsung SSD 990 PRO with Heatsink 4TB : 5
+
+* Power State #0 [SAME]
+    - INTEL SSDPEKKW256G7                   : <empty>
+    - PC611 NVMe SK hynix 512GB             : <empty>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <empty>
+
+* Power State #1 [SAME]
+    - INTEL SSDPEKKW256G7                   : <empty>
+    - PC611 NVMe SK hynix 512GB             : <empty>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <empty>
+
+* Power State #2 [SAME]
+    - INTEL SSDPEKKW256G7                   : <empty>
+    - PC611 NVMe SK hynix 512GB             : <empty>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <empty>
+
+* Power State #3 [SAME]
+    - INTEL SSDPEKKW256G7                   : <empty>
+    - PC611 NVMe SK hynix 512GB             : <empty>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <empty>
+
+* Power State #4 [SAME]
+    - INTEL SSDPEKKW256G7                   : <empty>
+    - PC611 NVMe SK hynix 512GB             : <empty>
+    - Samsung SSD 990 PRO with Heatsink 4TB : <empty>
+
+* Relative Read Latency [DIFF]
+    - INTEL SSDPEKKW256G7                   : 4
+    - PC611 NVMe SK hynix 512GB             : 3
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
+
+* Relative Read Throughput [DIFF]
+    - INTEL SSDPEKKW256G7                   : 4
+    - PC611 NVMe SK hynix 512GB             : 3
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
+
+* Relative Write Latency [DIFF]
+    - INTEL SSDPEKKW256G7                   : 4
+    - PC611 NVMe SK hynix 512GB             : 3
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
+
+* Relative Write Throughput [DIFF]
+    - INTEL SSDPEKKW256G7                   : 4
+    - PC611 NVMe SK hynix 512GB             : 3
+    - Samsung SSD 990 PRO with Heatsink 4TB : 4
