@@ -116,6 +116,9 @@ struct nvme_host_sgl_ctx {
 static int  nvme_host_module_init(void);
 static void nvme_host_bdev_submit_request(struct spdk_io_channel *ch,
 					  struct spdk_bdev_io *bdev_io);
+static void nvme_host_read_get_buf_cb(struct spdk_io_channel *ch,
+				      struct spdk_bdev_io *bdev_io,
+				      bool success);
 static bool nvme_host_bdev_io_type_supported(void *ctx,
 					     enum spdk_bdev_io_type io_type);
 static struct spdk_io_channel *nvme_host_bdev_get_io_channel(void *ctx);
@@ -214,60 +217,61 @@ nvme_host_io_sgl_cb(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 }
 
 static void
+nvme_host_read_get_buf_cb(struct spdk_io_channel *ch,
+			  struct spdk_bdev_io *bdev_io,
+			  bool success)
+{
+	if (!success) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	nvme_host_bdev_submit_request(ch, bdev_io);
+}
+
+static void
 nvme_host_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct nvme_host_io_channel *host_ch = spdk_io_channel_get_ctx(ch);
 	struct nvme_host_bdev *bdev_ctx = host_ch->bdev_ctx;
 	struct nvme_host_sgl_ctx *sgl_ctx = NULL;
-	int retries;
 	int rc = 0;
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
-		/* Defensive guard: bdev request must contain at least one iovec. */
+		/* Acquire a data buffer for requests that arrived without iovecs. */
 		if (bdev_io->u.bdev.iovcnt <= 0) {
-			rc = -EINVAL;
-			break;
+			spdk_bdev_io_get_buf(bdev_io, nvme_host_read_get_buf_cb,
+					     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+			return;
 		}
 
-		/*
-		 * Retry transient -ENOMEM from nvme submit path after polling completions.
-		 * This avoids surfacing queue-pressure as immediate media I/O failures.
-		 */
-		retries = 0;
-		do {
-			if (bdev_io->u.bdev.iovcnt == 1) {
-				/* Fast path for contiguous payload. */
-				rc = spdk_nvme_ns_cmd_read(bdev_ctx->ns, host_ch->qpair,
+		if (bdev_io->u.bdev.iovcnt == 1) {
+			/* Fast path for contiguous payload. */
+			rc = spdk_nvme_ns_cmd_read(bdev_ctx->ns, host_ch->qpair,
 						   bdev_io->u.bdev.iovs[0].iov_base,
 						   bdev_io->u.bdev.offset_blocks,
 						   bdev_io->u.bdev.num_blocks,
 						   nvme_host_io_cb, bdev_io, 0);
-			} else {
-				/* Multi-iov path uses readv + SGL callbacks. */
-				if (sgl_ctx == NULL) {
-					sgl_ctx = calloc(1, sizeof(*sgl_ctx));
-					if (sgl_ctx == NULL) {
-						rc = -ENOMEM;
-						break;
-					}
-					/* Capture request scatter-gather array for callback iteration. */
-					sgl_ctx->bdev_io = bdev_io;
-					sgl_ctx->iovs = bdev_io->u.bdev.iovs;
-					sgl_ctx->iovcnt = bdev_io->u.bdev.iovcnt;
-				}
+		} else {
+			/* Multi-iov path uses readv + SGL callbacks. */
+			sgl_ctx = calloc(1, sizeof(*sgl_ctx));
+			if (sgl_ctx == NULL) {
+				rc = -ENOMEM;
+				break;
+			}
 
-				rc = spdk_nvme_ns_cmd_readv(bdev_ctx->ns, host_ch->qpair,
+			/* Capture request scatter-gather array for callback iteration. */
+			sgl_ctx->bdev_io = bdev_io;
+			sgl_ctx->iovs = bdev_io->u.bdev.iovs;
+			sgl_ctx->iovcnt = bdev_io->u.bdev.iovcnt;
+
+			rc = spdk_nvme_ns_cmd_readv(bdev_ctx->ns, host_ch->qpair,
 						    bdev_io->u.bdev.offset_blocks,
 						    bdev_io->u.bdev.num_blocks,
 						    nvme_host_io_sgl_cb, sgl_ctx, 0,
 						    nvme_host_sgl_reset, nvme_host_sgl_next);
-			}
-
-			if (rc == -ENOMEM) {
-				spdk_nvme_qpair_process_completions(host_ch->qpair, 0);
-			}
-		} while (rc == -ENOMEM && ++retries < 1024);
+		}
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		/* Defensive guard: bdev request must contain at least one iovec. */
@@ -276,41 +280,32 @@ nvme_host_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *b
 			break;
 		}
 
-		/* Same bounded retry policy as read path. */
-		retries = 0;
-		do {
-			if (bdev_io->u.bdev.iovcnt == 1) {
-				/* Fast path for contiguous payload. */
-				rc = spdk_nvme_ns_cmd_write(bdev_ctx->ns, host_ch->qpair,
+		if (bdev_io->u.bdev.iovcnt == 1) {
+			/* Fast path for contiguous payload. */
+			rc = spdk_nvme_ns_cmd_write(bdev_ctx->ns, host_ch->qpair,
 						    bdev_io->u.bdev.iovs[0].iov_base,
 						    bdev_io->u.bdev.offset_blocks,
 						    bdev_io->u.bdev.num_blocks,
 						    nvme_host_io_cb, bdev_io, 0);
-			} else {
-				/* Multi-iov path uses writev + SGL callbacks. */
-				if (sgl_ctx == NULL) {
-					sgl_ctx = calloc(1, sizeof(*sgl_ctx));
-					if (sgl_ctx == NULL) {
-						rc = -ENOMEM;
-						break;
-					}
-					/* Capture request scatter-gather array for callback iteration. */
-					sgl_ctx->bdev_io = bdev_io;
-					sgl_ctx->iovs = bdev_io->u.bdev.iovs;
-					sgl_ctx->iovcnt = bdev_io->u.bdev.iovcnt;
-				}
+		} else {
+			/* Multi-iov path uses writev + SGL callbacks. */
+			sgl_ctx = calloc(1, sizeof(*sgl_ctx));
+			if (sgl_ctx == NULL) {
+				rc = -ENOMEM;
+				break;
+			}
 
-				rc = spdk_nvme_ns_cmd_writev(bdev_ctx->ns, host_ch->qpair,
+			/* Capture request scatter-gather array for callback iteration. */
+			sgl_ctx->bdev_io = bdev_io;
+			sgl_ctx->iovs = bdev_io->u.bdev.iovs;
+			sgl_ctx->iovcnt = bdev_io->u.bdev.iovcnt;
+
+			rc = spdk_nvme_ns_cmd_writev(bdev_ctx->ns, host_ch->qpair,
 						     bdev_io->u.bdev.offset_blocks,
 						     bdev_io->u.bdev.num_blocks,
 						     nvme_host_io_sgl_cb, sgl_ctx, 0,
 						     nvme_host_sgl_reset, nvme_host_sgl_next);
-			}
-
-			if (rc == -ENOMEM) {
-				spdk_nvme_qpair_process_completions(host_ch->qpair, 0);
-			}
-		} while (rc == -ENOMEM && ++retries < 1024);
+		}
 		break;
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		rc = spdk_nvme_ns_cmd_flush(bdev_ctx->ns, host_ch->qpair,
@@ -322,8 +317,16 @@ nvme_host_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *b
 		return;
 	}
 
+	if (rc == -ENOMEM) {
+		if (sgl_ctx != NULL) {
+			free(sgl_ctx);
+		}
+
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
+		return;
+	}
+
 	if (rc) {
-		/* Keep legacy behavior: fail bdev I/O if command submission failed. */
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 
