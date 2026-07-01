@@ -1523,31 +1523,42 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	spdk_pci_device_cfg_write16(pci_dev, cmd_reg, 4);
 
 	// 1. SKIP Enable device (Apparently, it is enabled by the dpdk-devbind)
-	// 2. map BARs for Submission Queue, Completion Queueu, and the Data Transmission
+	// 2. map BARs for Submission Queue, Completion Queue, and the Data Transmission
 
-	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR, &hw->sq.vaddr, &hw->sq.paddr, &hw->sq.size);
+	struct fpga_bar_ctx bar0 = {0}, bar2 = {0};
+
+	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR /* physical BAR0 */, &bar0.vaddr, &bar0.paddr, &bar0.size);
 	if (rc) {
-		fprintf(stderr, "Unable to map BAR %d (SQ)\n", SQ_BAR);
+		fprintf(stderr, "Unable to map physical BAR 0\n");
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR, &hw->cq.vaddr, &hw->cq.paddr, &hw->cq.size);
+	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR /* physical BAR2 */, &bar2.vaddr, &bar2.paddr, &bar2.size);
 	if (rc) {
-		fprintf(stderr, "Unable to map BAR %d (CQ)\n", CQ_BAR);
+		fprintf(stderr, "Unable to map physical BAR 2\n");
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &hw->wrbuff.vaddr, &hw->wrbuff.paddr, &hw->wrbuff.size);
-	if (rc) {
-		fprintf(stderr, "Unable to map BAR %d (WR buffer)\n", WRBUFF_BAR);
-		return rc;
-	}
+	/* Two-BAR PF1 layout: BAR0 = {SQ lower half, CQ upper half},
+	 * BAR2 = {WrBuf lower half, RdBuf upper half}. Each region is 128 KiB. */
+	uint64_t bar0_half = bar0.size / 2;
+	uint64_t bar2_half = bar2.size / 2;
 
-	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &hw->rdbuff.vaddr, &hw->rdbuff.paddr, &hw->rdbuff.size);
-	if (rc) {
-		fprintf(stderr, "Unable to map BAR %d (RD buffer)\n", RDBUFF_BAR);
-		return rc;
-	}
+	hw->sq.vaddr = bar0.vaddr;
+	hw->sq.paddr = bar0.paddr;
+	hw->sq.size  = bar0_half;
+
+	hw->cq.vaddr = (uint8_t *)bar0.vaddr + bar0_half;
+	hw->cq.paddr = bar0.paddr + bar0_half;
+	hw->cq.size  = bar0_half;
+
+	hw->wrbuff.vaddr = bar2.vaddr;
+	hw->wrbuff.paddr = bar2.paddr;
+	hw->wrbuff.size  = bar2_half;
+
+	hw->rdbuff.vaddr = (uint8_t *)bar2.vaddr + bar2_half;
+	hw->rdbuff.paddr = bar2.paddr + bar2_half;
+	hw->rdbuff.size  = bar2_half;
 
 	if (hw->cq.vaddr == NULL || hw->sq.vaddr == NULL || hw->rdbuff.vaddr == NULL || hw->wrbuff.vaddr == NULL) {
 		fprintf(stderr, "Virtual BAR adresses invalid!\n");
