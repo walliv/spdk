@@ -43,6 +43,7 @@
 #define REG_RDBUFF_PRP_LIST_PTR 0x30
 #define REG_WRBUFF_BADDR        0x38
 #define REG_WRBUFF_PRP_LIST_PTR 0x40
+#define REG_SUCC_COMPL_CNTR_L 0x9C
 #define REG_LBA_NUM_MASK        0x98
 #define REG_LBA_SPACE_SIZE      0xD4
 #define REG_META_PTR 			0x10C
@@ -54,10 +55,10 @@
 #define STAT_RST_DONE       	 (1 << 1)
 #define STAT_TAG_FIFO_INIT_DONE  (1 << 2)
 
-#define SQ_BAR 0
-#define CQ_BAR 1
+#define CQ_BAR    0
 #define WRBUFF_BAR 2
-#define RDBUFF_BAR 3
+#define BUFF_SIZE  (128 * 1024)
+#define REG_SQ_BADDR 0x160
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr	*ctrlr;
@@ -960,6 +961,26 @@ queues_alloc(struct app_ctx *app_ctx)
 		qopts.io_queue_size = app_ctx->qsize;
 	}
 
+	/* Allocate SQ in host DRAM; the FPGA posts SQEs here via PCIe RQ MemWr */
+	{
+		uint64_t sq_dma_size = (uint64_t)qopts.io_queue_size * sizeof(struct spdk_nvme_cmd);
+		hw->sq.size  = sq_dma_size;
+		hw->sq.vaddr = spdk_dma_zmalloc(sq_dma_size, 4096, NULL);
+		if (hw->sq.vaddr == NULL) {
+			fprintf(stderr, "ERROR: Failed to allocate SQ host DRAM buffer\n");
+			rc = -14;
+			goto qid_alloc_fail;
+		}
+		hw->sq.paddr = spdk_vtophys(hw->sq.vaddr, &sq_dma_size);
+		if (hw->sq.paddr == SPDK_VTOPHYS_ERROR) {
+			fprintf(stderr, "ERROR: Failed to get PA of SQ host DRAM buffer\n");
+			spdk_dma_free(hw->sq.vaddr);
+			hw->sq.vaddr = NULL;
+			rc = -15;
+			goto qid_alloc_fail;
+		}
+	}
+
 	hw->doorbell_mask = qopts.io_queue_size - 1;
 
 	qopts.sq.vaddr = hw->sq.vaddr;
@@ -1045,6 +1066,10 @@ cq_create_fail:
 		g_namespace.hw_qid = -1;
 	}
 qid_alloc_fail:
+	if (hw->sq.vaddr) {
+		spdk_dma_free(hw->sq.vaddr);
+		hw->sq.vaddr = NULL;
+	}
 	return rc;
 }
 
@@ -1078,6 +1103,10 @@ static void
 queues_dealloc(struct fpga_hw_ctx *hw)
 {
 	queues_delete(hw);
+	if (hw->sq.vaddr) {
+		spdk_dma_free(hw->sq.vaddr);
+		hw->sq.vaddr = NULL;
+	}
 	if (hw->qid_allocated) {
 		spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
 		hw->qid_allocated = false;
@@ -1356,12 +1385,29 @@ static int dma_ctrl_init(struct fpga_hw_ctx *hw, struct dma_device_ctx *dma_ctx)
 {
 	int rc = 0;
 	int node;
+	uint64_t rdbuf_dma_size;
+
+	/* Allocate RdBuf in host DRAM; Samsung DMA-reads from here for NVMe WRITE payload */
+	hw->rdbuff.size  = BUFF_SIZE;
+	hw->rdbuff.vaddr = spdk_dma_zmalloc(BUFF_SIZE, 4096, NULL);
+	if (hw->rdbuff.vaddr == NULL) {
+		fprintf(stderr, "ERROR: Failed to allocate RdBuf host DRAM buffer\n");
+		return -1;
+	}
+	rdbuf_dma_size   = BUFF_SIZE;
+	hw->rdbuff.paddr = spdk_vtophys(hw->rdbuff.vaddr, &rdbuf_dma_size);
+	if (hw->rdbuff.paddr == SPDK_VTOPHYS_ERROR) {
+		fprintf(stderr, "ERROR: Failed to get PA of RdBuf host DRAM buffer\n");
+		spdk_dma_free(hw->rdbuff.vaddr);
+		hw->rdbuff.vaddr = NULL;
+		return -2;
+	}
 
 	node = nfb_comp_find(dma_ctx->dev, "ziti,dma_iuventus", 0);
 	dma_ctx->comp = nfb_comp_open(dma_ctx->dev, node);
 	if (dma_ctx->comp == NULL) {
 		fprintf(stderr, "ERROR: Failed to open DMA control registers as nfb_comp!\n");
-		rc = -2;
+		rc = -3;
 		goto dma_open_fail;
 	}
 
@@ -1374,6 +1420,7 @@ static int dma_ctrl_init(struct fpga_hw_ctx *hw, struct dma_device_ctx *dma_ctx)
 	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, hw->doorbell_mask);
 	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BADDR, hw->sqtdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BADDR, hw->cqhdbl_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_SQ_BADDR, hw->sq.paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_BADDR, hw->rdbuff.paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_PRP_LIST_PTR, hw->rdbuff_prp_list.paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_BADDR, hw->wrbuff.paddr);
@@ -1387,12 +1434,18 @@ prp_alloc_fail:
 	nfb_comp_close(dma_ctx->comp);
 	dma_ctx->comp = NULL;
 dma_open_fail:
+	spdk_dma_free(hw->rdbuff.vaddr);
+	hw->rdbuff.vaddr = NULL;
 	return rc;
 }
 
 static void dma_ctrl_deinit(struct fpga_hw_ctx *hw, struct dma_device_ctx *dma_ctx)
 {
 	prp_list_free(hw);
+	if (hw->rdbuff.vaddr) {
+		spdk_dma_free(hw->rdbuff.vaddr);
+		hw->rdbuff.vaddr = NULL;
+	}
 	if (dma_ctx->comp != NULL) {
 		nfb_comp_close(dma_ctx->comp);
 		dma_ctx->comp = NULL;
@@ -1437,13 +1490,15 @@ usage(const char *program_name)
 
 bool do_ctrl_rst = false;
 bool do_subs_rst = false;
+bool do_dup_sq_test = false;
+bool do_host_dbl_test = false;
 
 static int
 parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct app_ctx *ctx)
 {
 	int op, rc;
 
-	while ((op = getopt(argc, argv, "s:i:gm:L:hrt:cq:p:d:")) != -1) {
+	while ((op = getopt(argc, argv, "s:i:gm:L:hrt:cq:p:d:DH")) != -1) {
 		switch (op) {
 		case 'd':
 			ctx->select_dev = optarg;
@@ -1499,6 +1554,12 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct app_ctx
 		case 'r':
 			do_ctrl_rst = true;
 			break;
+		case 'D':
+			do_dup_sq_test = true;
+			break;
+		case 'H':
+			do_host_dbl_test = true;
+			break;
 		default:
 			usage(argv[0]);
 			return 1;
@@ -1527,7 +1588,7 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 
 	struct fpga_bar_ctx bar0 = {0}, bar2 = {0};
 
-	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR /* physical BAR0 */, &bar0.vaddr, &bar0.paddr, &bar0.size);
+	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR /* physical BAR0 */, &bar0.vaddr, &bar0.paddr, &bar0.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map physical BAR 0\n");
 		return rc;
@@ -1539,36 +1600,24 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 		return rc;
 	}
 
-	/* Two-BAR PF1 layout: BAR0 = {SQ lower half, CQ upper half},
-	 * BAR2 = {WrBuf lower half, RdBuf upper half}. Each region is 128 KiB. */
-	uint64_t bar0_half = bar0.size / 2;
-	uint64_t bar2_half = bar2.size / 2;
-
-	hw->sq.vaddr = bar0.vaddr;
-	hw->sq.paddr = bar0.paddr;
-	hw->sq.size  = bar0_half;
-
-	hw->cq.vaddr = (uint8_t *)bar0.vaddr + bar0_half;
-	hw->cq.paddr = bar0.paddr + bar0_half;
-	hw->cq.size  = bar0_half;
+	/* 2-BAR PF1 layout: BAR0 = CQ only, BAR2 = WrBuf only; SQ and RdBuf live in host DRAM */
+	hw->cq.vaddr = bar0.vaddr;
+	hw->cq.paddr = bar0.paddr;
+	hw->cq.size  = bar0.size;
 
 	hw->wrbuff.vaddr = bar2.vaddr;
 	hw->wrbuff.paddr = bar2.paddr;
-	hw->wrbuff.size  = bar2_half;
+	hw->wrbuff.size  = bar2.size;
 
-	hw->rdbuff.vaddr = (uint8_t *)bar2.vaddr + bar2_half;
-	hw->rdbuff.paddr = bar2.paddr + bar2_half;
-	hw->rdbuff.size  = bar2_half;
-
-	if (hw->cq.vaddr == NULL || hw->sq.vaddr == NULL || hw->rdbuff.vaddr == NULL || hw->wrbuff.vaddr == NULL) {
-		fprintf(stderr, "Virtual BAR adresses invalid!\n");
+	if (hw->cq.vaddr == NULL || hw->wrbuff.vaddr == NULL) {
+		fprintf(stderr, "Virtual BAR addresses invalid!\n");
 		return -1;
 	}
-	if (hw->cq.paddr == 0 || hw->sq.paddr == 0 || hw->rdbuff.paddr == 0 || hw->wrbuff.paddr == 0) {
-		fprintf(stderr, "Physical BAR adresses invalid!\n");
+	if (hw->cq.paddr == 0 || hw->wrbuff.paddr == 0) {
+		fprintf(stderr, "Physical BAR addresses invalid!\n");
 		return -2;
 	}
-	if (hw->cq.size == 0 || hw->sq.size == 0 || hw->rdbuff.size == 0 || hw->wrbuff.size == 0) {
+	if (hw->cq.size == 0 || hw->wrbuff.size == 0) {
 		fprintf(stderr, "BAR sizes invalid!\n");
 		return -3;
 	}
@@ -1689,6 +1738,146 @@ main(int argc, char **argv)
 	printf("\tCQHDBL physical address: 0x%lx\n", hw->cqhdbl_paddr);
 	printf("Queues allocated.\n");
 
+	if (do_host_dbl_test) {
+		rc = dma_ctrl_init(hw, &dma_ctx);
+		if (rc) {
+			fprintf(stderr, "HOST-DBL: DMA init failed\n");
+			goto dma_ctrl_alloc_fail;
+		}
+		nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_RPT_UPD_EN | CTRL_ENABLE);
+		usleep(1);
+		volatile struct spdk_nvme_registers *nvme_regs =
+			spdk_nvme_ctrlr_get_registers(g_namespace.ctrlr);
+		volatile uint32_t *sq_tdbl_va = (volatile uint32_t *)(
+			(uintptr_t)nvme_regs + 0x1000 +
+			(2 * g_namespace.hw_qid) * (4 << hw->doorbell_stride));
+		printf("=== HOST-DBL TEST: FPGA enabled (qid=%d, dstrd=%u). Trigger ops now; will ring "
+		       "Samsung SQTDBL from the host CPU on any stall. Ctrl-C to stop. ===\n",
+		       g_namespace.hw_qid, hw->doorbell_stride);
+		fflush(stdout);
+		signal(SIGINT, sig_usr);
+		signal(SIGTERM, sig_usr);
+		int rung = 0;
+		for (int i = 0; i < 1200 && !stop; i++) {
+			uint16_t tail = nfb_comp_read16(dma_ctx.comp, REG_SQTDBL);
+			uint16_t head = nfb_comp_read16(dma_ctx.comp, REG_SQHDBL);
+			if (tail != head) {
+				usleep(300000);
+				uint16_t head2 = nfb_comp_read16(dma_ctx.comp, REG_SQHDBL);
+				uint16_t tail2 = nfb_comp_read16(dma_ctx.comp, REG_SQTDBL);
+				if (head2 == head && tail2 == tail) {
+					uint64_t sc0 = nfb_comp_read64(dma_ctx.comp, REG_SUCC_COMPL_CNTR_L);
+					printf("=== STALL: SQTDBL=%u SQHDBL=%u succ=%lu -> ringing Samsung SQTDBL=%u via host CPU MMIO ===\n",
+					       tail, head, sc0, tail);
+					fflush(stdout);
+					*sq_tdbl_va = tail;
+					rung++;
+					sleep(1);
+					uint16_t head3 = nfb_comp_read16(dma_ctx.comp, REG_SQHDBL);
+					uint64_t sc1 = nfb_comp_read64(dma_ctx.comp, REG_SUCC_COMPL_CNTR_L);
+					printf("=== AFTER HOST DOORBELL #%d: SQHDBL %u->%u, succ %lu->%lu (%s) ===\n",
+					       rung, head, head3, sc0, sc1,
+					       (head3 != head || sc1 != sc0) ? "UNWEDGED - completion advanced!" : "still stalled");
+					fflush(stdout);
+					if (rung == 1) {
+						uint8_t *sqe = (uint8_t *)hw->sq.vaddr;
+						printf("=== HOST SQ[slot0] 64B (did FPGA write a valid SQE to host DRAM?): ");
+						for (int b = 0; b < 64; b++) printf("%02x", sqe[b]);
+						printf(" ===\n");
+						printf("=== hw->sq.paddr=0x%lx ; FPGA REG_SQ_BADDR match check below ===\n", hw->sq.paddr);
+						fflush(stdout);
+					}
+				}
+			}
+			usleep(100000);
+		}
+		nfb_comp_write16(dma_ctx.comp, REG_CONTROL, 0);
+		dma_ctrl_deinit(hw, &dma_ctx);
+		goto dma_ctrl_alloc_fail;
+	}
+
+	if (do_dup_sq_test) {
+		struct spdk_nvme_cmd dup_cmd = {0};
+		int dup_rc;
+
+		rc = dma_ctrl_init(hw, &dma_ctx);
+		if (rc) {
+			fprintf(stderr, "DUP-SQ TEST: DMA init failed\n");
+			goto dma_ctrl_alloc_fail;
+		}
+
+		nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_RPT_UPD_EN | CTRL_ENABLE);
+		usleep(1);
+
+		printf("=== DUP-SQ TEST: FPGA DMA enabled, I/O window open (5s) -- run writes now ===\n");
+		fflush(stdout);
+		sleep(5);
+
+		nfb_comp_write16(dma_ctx.comp, REG_CONTROL, 0);
+		printf("=== DUP-SQ TEST: I/O window closed, waiting 2s for Samsung SQ wedge ===\n");
+		fflush(stdout);
+		sleep(2);
+
+		printf("=== DUP-SQ TEST: sending CREATE_IO_SQ SQID=%d without prior DELETE ===\n",
+		       g_namespace.hw_qid);
+		fflush(stdout);
+
+		dup_cmd.opc = SPDK_NVME_OPC_CREATE_IO_SQ;
+		dup_cmd.cdw10_bits.create_io_q.qid = g_namespace.hw_qid;
+		dup_cmd.cdw10_bits.create_io_q.qsize = hw->doorbell_mask;
+		dup_cmd.cdw11_bits.create_io_sq.pc = 1;
+		dup_cmd.cdw11_bits.create_io_sq.qprio = 2;
+		dup_cmd.cdw11_bits.create_io_sq.cqid = g_namespace.hw_qid;
+		dup_cmd.dptr.prp.prp1 = hw->sq.paddr;
+
+		dup_rc = submit_admin_request(&dup_cmd, "DUP_SQ_CREATE");
+		printf("=== DUP-SQ TEST result: %s (rc=%d) ===\n",
+		       dup_rc == 0 ? "ACCEPTED (controller freed the SQ slot -- true eviction)"
+		                   : "REJECTED (controller still owns the SQ -- frozen in place)",
+		       dup_rc);
+		fflush(stdout);
+
+		/* ----------------------------------------------------------------
+		 * HOST CPU DOORBELL TEST
+		 * The queue is frozen: the FPGA's P2P doorbell writes are ignored.
+		 * Try writing SQTDBL from the host CPU (through the root complex).
+		 * The SQE at position (sq_tail) in the FPGA BAR is a stale but
+		 * structurally valid NVMe WRITE command left from previous I/O.
+		 * If Samsung responds, succ_cpls will increment.
+		 * ---------------------------------------------------------------- */
+		{
+			uint16_t sq_tail = nfb_comp_read16(dma_ctx.comp, REG_SQTDBL);
+			uint32_t new_tail = (sq_tail + 1) & hw->doorbell_mask;
+			volatile struct spdk_nvme_registers *nvme_regs =
+				spdk_nvme_ctrlr_get_registers(g_namespace.ctrlr);
+			volatile uint32_t *sq_tdbl_va = (volatile uint32_t *)(
+				(uintptr_t)nvme_regs + 0x1000 +
+				(2 * g_namespace.hw_qid) * (4 << hw->doorbell_stride));
+
+			printf("=== HOST DOORBELL: FPGA SQTDBL=%u, writing new_tail=%u via CPU MMIO ===\n",
+			       sq_tail, new_tail);
+			fflush(stdout);
+
+			/* Re-enable FPGA CQE processing so it can catch a response */
+			nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_RPT_UPD_EN | CTRL_ENABLE);
+			usleep(1);
+
+			/* CPU writes Samsung's SQTDBL -- goes through root complex */
+			*sq_tdbl_va = new_tail;
+
+			printf("=== HOST DOORBELL: doorbell written, polling 2s for Samsung response ===\n");
+			fflush(stdout);
+			sleep(2);
+
+			nfb_comp_write16(dma_ctx.comp, REG_CONTROL, 0);
+			printf("=== HOST DOORBELL: done -- check succ_cpls for result ===\n");
+			fflush(stdout);
+		}
+
+		dma_ctrl_deinit(hw, &dma_ctx);
+		goto dma_ctrl_alloc_fail;
+	}
+
 	rc = dma_ctrl_init(hw, &dma_ctx);
 	if (rc) {
 		fprintf(stderr, "Error configuring the DMA Iuventus controller structure\n");
@@ -1710,7 +1899,7 @@ main(int argc, char **argv)
 	 * managed entirely by the FPGA DMA logic – no additional
 	 * synchronisation between the two paths is required here.
 	 */
-	rc = host_fs_init(g_namespace.ns);
+	/* P2P: ublk off */ // rc = host_fs_init(g_namespace.ns);
 	if (rc) {
 		fprintf(stderr, "Warning: host filesystem (ublk) initialisation failed (%d).\n"
 			"The FPGA path will continue to operate normally.\n", rc);
