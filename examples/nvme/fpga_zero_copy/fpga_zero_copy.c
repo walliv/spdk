@@ -883,11 +883,14 @@ struct app_ctx {
 };
 
 volatile int stop = 0;
+volatile sig_atomic_t g_dumpreq = 0;
 
 static void sig_usr(int signo)
 {
 	if (signo == SIGINT || signo == SIGTERM) {
 		stop = 1;
+	} else if (signo == SIGUSR1) {
+		g_dumpreq = 1;
 	}
 }
 
@@ -937,6 +940,144 @@ submit_admin_request(struct spdk_nvme_cmd *cmd, const char *cmd_name)
 		return -2;
 
 	return 0;
+}
+
+
+/* P2P test: disable APST (needs 256B APST-table buffer) and force PS0 on the
+ * live controller (volatile; Samsung rejects the SAVE bit). Verify via GET. */
+static uint32_t g_feat_val;
+static bool     g_feat_done;
+static int      g_feat_status;
+static void
+feat_get_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
+{
+	g_feat_done = true;
+	if (spdk_nvme_cpl_is_error(cpl)) { g_feat_status = -1; return; }
+	g_feat_val = cpl->cdw0;
+}
+static uint32_t
+get_feature_val(uint8_t fid)
+{
+	void *buf = spdk_dma_zmalloc(4096, 0x1000, NULL);
+	g_feat_done = false; g_feat_status = 0; g_feat_val = 0xffffffff;
+	if (spdk_nvme_ctrlr_cmd_get_feature(g_namespace.ctrlr, fid, 0, buf, 4096,
+					    feat_get_cb, NULL)) {
+		if (buf) spdk_dma_free(buf);
+		return 0xffffffff;
+	}
+	while (!g_feat_done)
+		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
+	if (buf) spdk_dma_free(buf);
+	return g_feat_val;
+}
+static bool g_set_done;
+static int  g_set_status;
+static void
+feat_set_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
+{
+	g_set_done = true;
+	g_set_status = spdk_nvme_cpl_is_error(cpl) ? -1 : 0;
+}
+static int
+set_feature_buf(uint8_t fid, uint32_t cdw11, void *buf, uint32_t len)
+{
+	g_set_done = false; g_set_status = 0;
+	if (spdk_nvme_ctrlr_cmd_set_feature(g_namespace.ctrlr, fid, cdw11, 0,
+					    buf, len, feat_set_cb, NULL))
+		return -1;
+	while (!g_set_done)
+		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
+	return g_set_status;
+}
+static void
+force_active_power_state(void)
+{
+	void *apst_buf;
+	uint32_t a, pm;
+
+	printf("P2P: forcing APST off + PS0 on live controller...\n");
+	apst_buf = spdk_dma_zmalloc(256, 0x1000, NULL);
+	if (set_feature_buf(0x0c, 0x0, apst_buf, 256))
+		fprintf(stderr, "WARN: SET APST-disable failed\n");
+	if (set_feature_buf(0x02, 0x0, NULL, 0))
+		fprintf(stderr, "WARN: SET PS0 failed\n");
+	if (apst_buf)
+		spdk_dma_free(apst_buf);
+
+	a = get_feature_val(0x0c);
+	pm = get_feature_val(0x02);
+	printf("P2P VERIFY: APST(0x0c) cdw0=0x%08x (APSTE bit0=%u); PWRMGMT(0x02) cdw0=0x%08x (PS=%u)\n",
+	       a, a & 0x1, pm, pm & 0x1f);
+}
+
+
+/* P2P diagnostic: dump the drive's own NVMe log pages (Error Info 0x01,
+ * SMART 0x02) and CSTS, decoded. Called at baseline and on SIGUSR1. */
+static bool g_log_done;
+static int  g_log_status;
+static void
+log_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
+{
+	g_log_done = true;
+	g_log_status = spdk_nvme_cpl_is_error(cpl) ? -1 : 0;
+}
+static int
+get_log(uint8_t lid, void *buf, uint32_t sz)
+{
+	g_log_done = false; g_log_status = 0;
+	if (spdk_nvme_ctrlr_cmd_get_log_page(g_namespace.ctrlr, lid, 0xffffffff,
+					     buf, sz, 0, log_cb, NULL))
+		return -1;
+	while (!g_log_done)
+		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
+	return g_log_status;
+}
+static void
+dump_nvme_logs(const char *tag)
+{
+	void *buf = spdk_dma_zmalloc(4096, 0x1000, NULL);
+	union spdk_nvme_csts_register csts;
+	int i, shown;
+
+	printf("==== NVME LOGS [%s] ====\n", tag);
+	csts = spdk_nvme_ctrlr_get_regs_csts(g_namespace.ctrlr);
+	printf("[%s] CSTS: rdy=%u cfs=%u shst=%u\n", tag,
+	       csts.bits.rdy, csts.bits.cfs, csts.bits.shst);
+
+	if (buf && get_log(0x02, buf, 512) == 0) {
+		struct spdk_nvme_health_information_page *h = buf;
+		printf("[%s] SMART: critical_warning=0x%02x temperature=%uK media_errors=%lu num_err_log_entries=%lu ctrl_busy_time=%lu\n",
+		       tag, h->critical_warning.raw, h->temperature,
+		       (unsigned long)h->media_errors[0],
+		       (unsigned long)h->num_error_info_log_entries[0],
+		       (unsigned long)h->controller_busy_time[0]);
+	} else {
+		printf("[%s] SMART(0x02): READ FAILED\n", tag);
+	}
+
+	if (buf && get_log(0x01, buf, 64 * sizeof(struct spdk_nvme_error_information_entry)) == 0) {
+		struct spdk_nvme_error_information_entry *e = buf;
+		shown = 0;
+		printf("[%s] ERROR-INFO(0x01): entries with error_count>0:\n", tag);
+		for (i = 0; i < 64; i++) {
+			uint16_t st;
+			if (e[i].error_count == 0)
+				continue;
+			st = *(uint16_t *)&e[i].status;
+			printf("  [%s] ent%d: error_count=%lu sqid=%u cid=%u status=0x%04x(sct=%u sc=0x%02x) err_loc=0x%04x lba=%lu nsid=0x%x vs=0x%02x\n",
+			       tag, i, (unsigned long)e[i].error_count, e[i].sqid, e[i].cid,
+			       st, (st >> 9) & 0x7, (st >> 1) & 0xff,
+			       e[i].error_location, (unsigned long)e[i].lba, e[i].nsid,
+			       e[i].vendor_specific);
+			if (++shown >= 8) break;
+		}
+		if (shown == 0)
+			printf("  [%s] (no entries with error_count>0)\n", tag);
+	} else {
+		printf("[%s] ERROR-INFO(0x01): READ FAILED\n", tag);
+	}
+	if (buf) spdk_dma_free(buf);
+	fflush(stdout);
 }
 
 static int
@@ -1678,6 +1819,9 @@ main(int argc, char **argv)
 	printf("\tCQHDBL physical address: 0x%lx\n", hw->cqhdbl_paddr);
 	printf("Queues allocated.\n");
 
+	force_active_power_state();
+	dump_nvme_logs("BASELINE");
+
 	rc = dma_ctrl_init(hw, &dma_ctx);
 	if (rc) {
 		fprintf(stderr, "Error configuring the DMA Iuventus controller structure\n");
@@ -1699,7 +1843,8 @@ main(int argc, char **argv)
 	 * managed entirely by the FPGA DMA logic – no additional
 	 * synchronisation between the two paths is required here.
 	 */
-	rc = host_fs_init(g_namespace.ns);
+	rc = 0; /* ublk/host-fs DISABLED for P2P counter test */
+	/* rc = host_fs_init(g_namespace.ns); */
 	if (rc) {
 		fprintf(stderr, "Warning: host filesystem (ublk) initialisation failed (%d).\n"
 			"The FPGA path will continue to operate normally.\n", rc);
@@ -1712,6 +1857,7 @@ main(int argc, char **argv)
 
 	signal(SIGINT, sig_usr);
 	signal(SIGTERM, sig_usr);
+	signal(SIGUSR1, sig_usr);
 
 	printf("Initialization complete. Starting main loop.\n");
 
@@ -1730,6 +1876,10 @@ main(int argc, char **argv)
 		int i;
 		for (i = 0; i < g_num_threads; i++) {
 			spdk_thread_poll(g_all_threads[i], 0, 0);
+		}
+		if (g_dumpreq) {
+			g_dumpreq = 0;
+			dump_nvme_logs("POST-WEDGE");
 		}
 		usleep(1000);
 	}
