@@ -1891,7 +1891,7 @@ main(int argc, char **argv)
 	}
 
 	/* Tear down the host filesystem before any lower-level cleanup. */
-	host_fs_fini();
+	/* host_fs_fini(); ublk/host-fs teardown DISABLED for P2P counter test */
 
 	dma_ctrl_deinit(hw, &dma_ctx);
 
