@@ -1,0 +1,31 @@
+{
+  "CNTER_CNT": 0,
+  "VALUE_CNT": 1,
+  "MI_DATA_WIDTH": 32,
+  "CTRLO_WIDTH": 0,
+  "CTRLI_WIDTH": 4,
+  "CNTER_WIDTH": 64,
+  "VALUE_WIDTH": [
+    22
+  ],
+  "VALUE_EN": [
+    {
+      "MIN": true,
+      "MAX": true,
+      "SUM": false,
+      "HIST": true
+    }
+  ],
+  "SUM_EXTRA_WIDTH": [
+    16
+  ],
+  "HIST_BOX_CNT": [
+    32768
+  ],
+  "HIST_BOX_WIDTH": [
+    32
+  ],
+  "HIST_STEP": [
+    128.0
+  ]
+}
