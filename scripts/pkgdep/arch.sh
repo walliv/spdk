@@ -8,15 +8,15 @@ pacman -Sy --needed --noconfirm gcc make cunit libaio openssl \
 	libutil-linux libiscsi python ncurses json-c cmocka ninja meson fuse3
 # Additional dependencies for SPDK CLI
 pacman -Sy --needed --noconfirm python-pexpect python-pip libffi
-pip install configshell_fb
-pip install pyelftools
-pip install ijson
-pip install python-magic
-pip install grpcio
-pip install grpcio-tools
-pip install pyyaml
-pip install Jinja2
-pip install tabulate
+# pip install configshell_fb
+# pip install pyelftools
+# pip install ijson
+# pip install python-magic
+# pip install grpcio
+# pip install grpcio-tools
+# pip install pyyaml
+# pip install Jinja2
+# pip install tabulate
 # Additional dependencies for DPDK
 pacman -Sy --needed --noconfirm numactl nasm
 # Additional dependencies for ISA-L used in compression
