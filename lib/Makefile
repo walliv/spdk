@@ -20,6 +20,10 @@ endif
 # in env_dpdk for resource discovery and BAR mapping. Restrict it to Linux
 # until those dependencies are made portable.
 DIRS-$(CONFIG_AMD_NTB) += ntb_amd
+
+ifeq ($(CONFIG_IUVENTUS),y)
+DIRS-y += iuventus
+endif
 endif
 
 # The ut library is used by unit tests and some functional tests, so build it only when either of
