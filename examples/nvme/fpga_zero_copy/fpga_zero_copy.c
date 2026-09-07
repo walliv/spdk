@@ -16,6 +16,7 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/nvme.h"
+#include "spdk/nvme_spec.h"
 #include "spdk/vmd.h"
 #include "spdk/env.h"
 #include "spdk/string.h"
@@ -30,37 +31,27 @@
 #define REG_SQHDBL              0x0C
 #define REG_CQHDBL              0x10
 #define REG_DBL_MASK            0x14
-#define REG_SQTDBL_INIT_VAL     0x18
-#define REG_SQ_BASE_ADDR        0x1C
-#define REG_SQTDBL_BASE_ADDR    0x24
-#define REG_CQHDBL_BASE_ADDR    0x2C
-#define REG_PRP_ENTRY_1_ADDR    0x34
-#define REG_PRP_ENTRY_2_ADDR    0x3C
-#define REG_START_LBA_PTR_LOW   0x44
-#define REG_LBA_AMOUNT          0x48
-#define REG_LAST_CQ_ENTRY       0x4C
-#define REG_SQES_DISPATCHED     0x5C
-#define REG_CQES_PROCESSED      0x64
-#define REG_RECV_PCIE_RDS       0x6C
-#define REG_RECV_PCIE_RDS_BYTES 0x74
-#define REG_RECV_PCIE_WRS       0x7C
-#define REG_RECV_PCIE_WRS_BYTES 0x84
-#define REG_PROC_RDS            0x8C
-#define REG_PROC_RDS_BYTES      0x94
-#define REG_LBA_MASK            0x9C
-#define REG_START_LBA_PTR_HIGH  0xCC
-#define REG_LBA_SPACE_SIZE      0xD0
-#define REG_CMDS_TO_DISP_CNTR_LOAD 0xD8
+#define REG_SQTDBL_BADDR        0x18
+#define REG_CQHDBL_BADDR        0x20
+#define REG_RDBUFF_BADDR        0x28
+#define REG_RDBUFF_PRP_LIST_PTR 0x30
+#define REG_WRBUFF_BADDR        0x38
+#define REG_WRBUFF_PRP_LIST_PTR 0x40
+#define REG_LBA_NUM_MASK        0x98
+#define REG_LBA_SPACE_SIZE      0xD4
+#define REG_META_PTR 			0x10C
 
-#define CTRL_LOAD_CNTR    (1 << 0)
-#define CTRL_RD_EN        (1 << 1)
-#define CTRL_CONTIG_DISP  (1 << 2)
-#define CTRL_SAMPLE_STATS (1 << 3)
-#define CTRL_CLR_ERR_MASK (1 << 4)
-#define CTRL_CNTRS_RST    (1 << 5)
-#define CTRL_SEQV_RW      (1 << 6)
-#define CTRL_RPT_UPD_EN   (1 << 7)
-#define CTRL_CQE_PROC_EN  (1 << 8)
+#define CTRL_ENABLE       (1 << 0)
+#define CTRL_RPT_UPD_EN   (1 << 4)
+
+#define STAT_READY         		 (1 << 0)
+#define STAT_RST_DONE       	 (1 << 1)
+#define STAT_TAG_FIFO_INIT_DONE  (1 << 2)
+
+#define SQ_BAR 0
+#define CQ_BAR 1
+#define WRBUFF_BAR 2
+#define RDBUFF_BAR 3
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr	*ctrlr;
@@ -89,23 +80,29 @@ struct qop_cpl_ctx {
 
 struct ncd_probe_ctx {
 	const char *select_dev;
-	uint32_t cmds_to_disp;
 	uint16_t qsize;
-	bool contiguous_dispatch;
 	struct spdk_nvme_transport_id *trid;
 	uint32_t nsid;
 	struct spdk_pci_device *dev;
-	/* struct spdk_nvme_cmd *sq_vaddr; */
-	void *sq_bar_vaddr;
-	uint64_t sq_bar_paddr;
-	uint64_t sq_bar_size;
-	void *cq_bar_vaddr;
-	uint64_t cq_bar_paddr;
-	uint64_t cq_bar_size;
-	// Servers as PRP1 entry
-	uint64_t data_bar_paddr;
-	void *data_bar_vaddr;
-	uint64_t data_bar_size;
+
+	void *sq_vaddr;
+	uint64_t sq_paddr;
+	uint64_t sq_byte_size;
+	void *cq_vaddr;
+	uint64_t cq_paddr;
+	uint64_t cq_byte_size;
+	void *wrbuff_vaddr;
+	uint64_t wrbuff_paddr;
+	uint64_t wrbuff_byte_size;
+	void *rdbuff_vaddr;
+	uint64_t rdbuff_paddr;
+	uint64_t rdbuff_byte_size;
+
+	void *wrbuff_prp_list_vaddr;
+	uint64_t wrbuff_prp_list_paddr;
+	void *rdbuff_prp_list_vaddr;
+	uint64_t rdbuff_prp_list_paddr;
+
 	uint64_t doorbell_base;
 	uint32_t doorbell_stride;
 
@@ -115,8 +112,8 @@ struct ncd_probe_ctx {
 	/* uint64_t sq_paddr; */
 	uint64_t sqtdbl_paddr;
 	uint64_t cqhdbl_paddr;
-	uint16_t lba_mask;
-	uint16_t lba_num;
+	uint16_t lba_num_mask;
+	uint64_t lba_space_size;
 };
 
 volatile int stop = 0;
@@ -131,6 +128,9 @@ static void sig_usr(int signo)
 static struct spdk_pci_id ncd_pci_driver_id[] = {
 	{
 		SPDK_PCI_DEVICE(0x18ec, 0xc020)
+	},
+	{
+		SPDK_PCI_DEVICE(0x1c2c, 0xc020)
 	},
 };
 
@@ -231,19 +231,19 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 
 	ncd_ctx->dbl_mask = qopts.io_queue_size -1;
 
-	qopts.sq.vaddr = ncd_ctx->sq_bar_vaddr;
-	qopts.sq.paddr = ncd_ctx->sq_bar_paddr;
+	qopts.sq.vaddr = ncd_ctx->sq_vaddr;
+	qopts.sq.paddr = ncd_ctx->sq_paddr;
 	qopts.sq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cmd);
 
-	qopts.cq.vaddr = ncd_ctx->cq_bar_vaddr;
-	qopts.cq.paddr = ncd_ctx->cq_bar_paddr;
+	qopts.cq.vaddr = ncd_ctx->cq_vaddr;
+	qopts.cq.paddr = ncd_ctx->cq_paddr;
 	qopts.cq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cpl);
 
 	// Reset the Completion Queue in the Hardware, otherwise previous completion entries get
-	// detected
-	struct spdk_nvme_cpl *cpl_buff = ncd_ctx->cq_bar_vaddr;
-	for (uint32_t i = 0; i < qopts.io_queue_size; i++) {
-		cpl_buff[i].status.p = 0;
+	// detected. This means return Phase Tags to value 0 (i.e. default value)
+	uint8_t *cpl_buff = ncd_ctx->cq_vaddr;
+	for (uint32_t i = 14; i < qopts.cq.buffer_size; i+=sizeof(struct spdk_nvme_cpl)) {
+		cpl_buff[i] = 0;
 	}
 
 	g_namespace.hw_qid = spdk_nvme_ctrlr_alloc_qid(g_namespace.ctrlr);
@@ -264,7 +264,7 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	cmd.cdw10_bits.create_io_q.qid = g_namespace.hw_qid;
 	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size-1;
 	cmd.cdw11_bits.create_io_cq.pc = 1;
-	cmd.dptr.prp.prp1 = ncd_ctx->cq_bar_paddr;
+	cmd.dptr.prp.prp1 = ncd_ctx->cq_paddr;
 
 	rc = submit_admin_request(&cmd, "CQ_CREATE");
 	if (rc) {
@@ -281,7 +281,7 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	cmd.cdw11_bits.create_io_sq.pc = 1;
 	cmd.cdw11_bits.create_io_sq.qprio = 2;
 	cmd.cdw11_bits.create_io_sq.cqid = g_namespace.hw_qid;
-	cmd.dptr.prp.prp1 = ncd_ctx->sq_bar_paddr;
+	cmd.dptr.prp.prp1 = ncd_ctx->sq_paddr;
 
 	rc = submit_admin_request(&cmd, "SQ_CREATE");
 	if (rc) {
@@ -299,7 +299,6 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	}
 
 	printf("SW queues allocated!\n");
-
 	return 0;
 
 swq_create_fail:
@@ -376,6 +375,18 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 }
 
 static void
+rd_ctrl_regs(struct spdk_nvme_ctrlr *ctrlr)
+{
+	union spdk_nvme_csts_register csts = spdk_nvme_ctrlr_get_regs_csts(ctrlr);
+	printf("Controller CSTS register:\n");
+	printf("\tCSTS.RDY: %d\n", csts.bits.rdy);
+	printf("\tCSTS.CFS: %d\n", csts.bits.cfs);
+	printf("\tCSTS.SHST: %d\n", csts.bits.shst);
+	printf("\tCSTS.NSSRO: %d\n", csts.bits.nssro);
+	printf("\tCSTS.PS: %d\n", csts.bits.pp);
+}
+
+static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
@@ -427,9 +438,9 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	// Unlimited Max Data transfer size
 	if (cdata->mdts == 0) {
-		probe_ctx->lba_mask = 0xFFFF;
+		probe_ctx->lba_num_mask = 0xFFFF;
 	} else {
-		probe_ctx->lba_mask = (uint16_t)((1 << (12 + cap.bits.mpsmin + cdata->mdts)) / sect_size) - 1;
+		probe_ctx->lba_num_mask = (uint16_t)((1 << (12 + cap.bits.mpsmin + cdata->mdts)) / sect_size) - 1;
 	}
 
 	printf("Controller options:\n");
@@ -440,7 +451,10 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("\tNS %d size:             %juGB\n", nsid, spdk_nvme_ns_get_size(ns) / 1000000000);
 	printf("\tNS number of sectors:  %ld\n", spdk_nvme_ns_get_num_sectors(ns));
 	printf("\tNS sector size:        %dB\n", sect_size);
-	printf("\tLBA Mask:              x%x (%d)\n", probe_ctx->lba_mask, probe_ctx->lba_mask);
+	printf("\tLBA Mask:              x%x (%d)\n", probe_ctx->lba_num_mask, probe_ctx->lba_num_mask);
+	probe_ctx->lba_space_size = spdk_nvme_ns_get_num_sectors(ns);
+
+	rd_ctrl_regs(ctrlr);
 
 	pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
 	if (!pci_dev) {
@@ -510,12 +524,72 @@ dev_open_fail:
 	return rc;
 }
 
+static int prp_list_alloc(struct ncd_probe_ctx *ncd_ctx)
+{
+	uint64_t size = VALUE_4KB;
+	ncd_ctx->wrbuff_prp_list_vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
+	if (ncd_ctx->wrbuff_prp_list_vaddr == NULL) {
+		fprintf(stderr, "ERROR: Write PRP list allocation failed\n");
+		return -1;
+	}
+
+	ncd_ctx->rdbuff_prp_list_vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
+	if (ncd_ctx->rdbuff_prp_list_vaddr == NULL) {
+		fprintf(stderr, "ERROR: Read PRP list allocation failed\n");
+		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
+		return -2;
+	}
+
+	ncd_ctx->wrbuff_prp_list_paddr = spdk_vtophys(ncd_ctx->wrbuff_prp_list_vaddr, &size);
+	if (ncd_ctx->wrbuff_prp_list_paddr == SPDK_VTOPHYS_ERROR) {
+		fprintf(stderr, "ERROR: Failed to get physical address of the Write PRP list buffer\n");
+		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
+		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		return -3;
+	}
+
+	if (size != VALUE_4KB) {
+		fprintf(stderr, "ERROR: Write PRP list buffer size is not 4096 bytes (detected size: %lu)\n", size);
+		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
+		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		return -4;
+	}
+
+	ncd_ctx->rdbuff_prp_list_paddr = spdk_vtophys(ncd_ctx->rdbuff_prp_list_vaddr, &size);
+	if (ncd_ctx->rdbuff_prp_list_paddr == SPDK_VTOPHYS_ERROR) {
+		fprintf(stderr, "ERROR: Failed to get physical address of the Read PRP list buffer\n");
+		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
+		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		return -5;
+	}
+
+	if (size != VALUE_4KB) {
+		fprintf(stderr, "ERROR: Read PRP list buffer size is not 4096 bytes (detected size: %lu)\n", size);
+		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
+		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		return -6;
+	}
+
+	for (int i = 1; i < (int)(ncd_ctx->wrbuff_byte_size / VALUE_4KB); i++) {
+		((uint64_t *)ncd_ctx->wrbuff_prp_list_vaddr)[i-1] = ncd_ctx->wrbuff_paddr + (i * VALUE_4KB);
+		((uint64_t *)ncd_ctx->rdbuff_prp_list_vaddr)[i-1] = ncd_ctx->rdbuff_paddr + (i * VALUE_4KB);
+	}
+
+	return 0;
+}
+
+static void prp_list_free(struct ncd_probe_ctx *ncd_ctx)
+{
+	spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
+	spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+}
+
 static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
 {
 	int rc = 0;
 	int node;
-	struct nfb_comp *dlogger;
-	uint16_t chosen_lba_num;
+	uint64_t meta_buff_size = VALUE_4KB;
+	uint64_t meta_buff_paddr;
 
 	node = nfb_comp_find(dma_ctx->dev, "ziti,dma_iuventus", 0);
 	dma_ctx->comp = nfb_comp_open(dma_ctx->dev, node);
@@ -525,42 +599,34 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 		goto dma_open_fail;
 	}
 
-	node = nfb_comp_find(dma_ctx->dev, "netcope,dma_iops_meter", 0);
-	dlogger = nfb_comp_open(dma_ctx->dev, node);
-	if (dlogger == NULL) {
-		fprintf(stderr, "ERROR: Failed to open Data Logger as nfb_comp!\n");
-		rc = -3;
-		goto dlogger_open_fail;
+	rc = prp_list_alloc(ncd_ctx);
+	if (rc) {
+		fprintf(stderr, "ERROR: PRP list allocation failed\n");
+		goto prp_alloc_fail;
 	}
 
-	// Send a reset and wait until its done
-	nfb_comp_write8(dlogger, 0, 1);
-	while(!(nfb_comp_read8(dlogger, 0) & 2));
-	printf("Reset of DMA Iuventus done!\n");
-
-	nfb_comp_close(dlogger);
-
 	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, ncd_ctx->dbl_mask);
-	nfb_comp_write64(dma_ctx->comp, REG_SQ_BASE_ADDR, 0);
-	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BASE_ADDR, ncd_ctx->sqtdbl_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BASE_ADDR, ncd_ctx->cqhdbl_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_1_ADDR, ncd_ctx->data_bar_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_2_ADDR, ncd_ctx->data_bar_paddr + VALUE_4KB);
-	if (ncd_ctx->lba_num > ncd_ctx->lba_mask)
-		chosen_lba_num = ncd_ctx->lba_mask;
-	else
-		// The subtraction of 1 is because the LBA amount in the SQ command is a 0 based
-		// value, meaining that 0 actually copies 1 LBA, 1 copies 2 LBAs and so on.
-		chosen_lba_num = ncd_ctx->lba_num-1;
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_AMOUNT, chosen_lba_num);
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_MASK, ncd_ctx->lba_mask);
-
+	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BADDR, ncd_ctx->sqtdbl_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BADDR, ncd_ctx->cqhdbl_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_BADDR, ncd_ctx->rdbuff_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_PRP_LIST_PTR, ncd_ctx->rdbuff_prp_list_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_BADDR, ncd_ctx->wrbuff_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_PRP_LIST_PTR, ncd_ctx->wrbuff_prp_list_paddr);
+	nfb_comp_write16(dma_ctx->comp, REG_LBA_NUM_MASK, ncd_ctx->lba_num_mask);
+	nfb_comp_write64(dma_ctx->comp, REG_LBA_SPACE_SIZE, ncd_ctx->lba_space_size);
+	nfb_comp_write64(dma_ctx->comp, REG_META_PTR, 0);
 	return 0;
 
-dlogger_open_fail:
+prp_alloc_fail:
 	nfb_comp_close(dma_ctx->comp);
 dma_open_fail:
 	return rc;
+}
+
+static void dma_ctrl_deinit(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
+{
+	prp_list_free(ncd_ctx);
+	nfb_comp_close(dma_ctx->comp);
 }
 
 static void
@@ -596,7 +662,8 @@ usage(const char *program_name)
 	printf("\t[-p <num> the amount of commands to dispatch]\n");
 }
 
-bool ctrl_rst_done = true;
+bool do_ctrl_rst = false;
+bool do_subs_rst = false;
 
 static int
 parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_probe_ctx *ctx)
@@ -608,13 +675,13 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 		case 'd':
 			ctx->select_dev = optarg;
 			break;
-		case 'p':
-			ctx->cmds_to_disp = spdk_strtol(optarg, 10);
-			if (ctx->cmds_to_disp < 1) {
-				fprintf(stderr, "Invalid amount of commands to dispatch (must be greater than 0)\n");
-				exit(EXIT_FAILURE);
-			}
-			break;
+		// case 'p':
+		// 	ctx->cmds_to_disp = spdk_strtol(optarg, 10);
+		// 	if (ctx->cmds_to_disp < 1) {
+		// 		fprintf(stderr, "Invalid amount of commands to dispatch (must be greater than 0)\n");
+		// 		exit(EXIT_FAILURE);
+		// 	}
+		// 	break;
 		case 'q':
 			ctx->qsize = spdk_strtol(optarg, 10);
 			if (ctx->qsize < 4) {
@@ -622,15 +689,11 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 				exit(EXIT_FAILURE);
 			}
 			break;
-		case 'c':
-			ctx->contiguous_dispatch = true;
-			break;
+		// case 'c':
+		// 	ctx->contiguous_dispatch = true;
+		// 	break;
 		case 's':
-			ctx->lba_num = spdk_strtol(optarg, 10);
-			if (ctx->lba_num < 1) {
-				fprintf(stderr, "Invalid amount of LBAs\n");
-				exit(EXIT_FAILURE);
-			}
+			do_subs_rst = true;
 			break;
 		case 'i':
 			env_opts->shm_id = spdk_strtol(optarg, 10);
@@ -671,7 +734,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 			usage(argv[0]);
 			exit(EXIT_SUCCESS);
 		case 'r':
-			ctrl_rst_done = false;
+			do_ctrl_rst = true;
 			break;
 		default:
 			usage(argv[0]);
@@ -687,8 +750,6 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	int rc;
 	uint16_t cmd_reg;
 	struct ncd_probe_ctx *probe_ctx = ctx;
-	/* uint64_t mem_register_start; */
-		/* mem_register_end; */
 
 	probe_ctx->dev = pci_dev;
 
@@ -700,51 +761,49 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	// 1. SKIP Enable device (Apparently, it is enabled by the dpdk-devbind)
 	// 2. map BARs for Submission Queue, Completion Queueu, and the Data Transmission
 
-	rc = spdk_pci_device_map_bar(pci_dev, 0, &probe_ctx->sq_bar_vaddr, &probe_ctx->sq_bar_paddr, &probe_ctx->sq_bar_size);
+	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR, &probe_ctx->sq_vaddr, &probe_ctx->sq_paddr, &probe_ctx->sq_byte_size);
 	if (rc) {
-		fprintf(stderr, "Unable to map BAR 0\n");
+		fprintf(stderr, "Unable to map BAR %d (SQ)\n", SQ_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, 2, &probe_ctx->cq_bar_vaddr, &probe_ctx->cq_bar_paddr, &probe_ctx->cq_bar_size);
+	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR, &probe_ctx->cq_vaddr, &probe_ctx->cq_paddr, &probe_ctx->cq_byte_size);
 	if (rc) {
-		fprintf(stderr, "Unable to map BAR 1\n");
+		fprintf(stderr, "Unable to map BAR %d (CQ)\n", CQ_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, 4, &probe_ctx->data_bar_vaddr, &probe_ctx->data_bar_paddr, &probe_ctx->data_bar_size);
+	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &probe_ctx->wrbuff_vaddr, &probe_ctx->wrbuff_paddr, &probe_ctx->wrbuff_byte_size);
 	if (rc) {
-		fprintf(stderr, "Unable to map BAR 2\n");
+		fprintf(stderr, "Unable to map BAR %d (WR buffer)\n", WRBUFF_BAR);
 		return rc;
 	}
 
-	/* printf("CQ BAR VADDR: %p\n", probe_ctx->cq_bar_vaddr); */
-	/* printf("CQ BAR PADDR: %lx\n", probe_ctx->cq_bar_paddr); */
-	/* printf("CQ BAR size:  %ld\n", probe_ctx->cq_bar_size); */
-	/* printf("DATA BAR VADDR: %p\n", probe_ctx->data_bar_vaddr); */
-	/* printf("DATA BAR PADDR: %lx\n", probe_ctx->data_bar_paddr); */
-	/* printf("DATA BAR size:  %ld\n", probe_ctx->data_bar_size); */
+	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &probe_ctx->rdbuff_vaddr, &probe_ctx->rdbuff_paddr, &probe_ctx->rdbuff_byte_size);
+	if (rc) {
+		fprintf(stderr, "Unable to map BAR %d (RD buffer)\n", RDBUFF_BAR);
+		return rc;
+	}
 
-	/* mem_register_start = _2MB_PAGE((uintptr_t)probe_ctx->cq_bar_vaddr); */
-	/* /\* mem_register_end = CEIL_2MB((uintptr_t)probe_ctx->cq_bar_vaddr + probe_ctx->cq_bar_size); *\/ */
-	/* assert(mem_register_start == (uintptr_t)probe_ctx->cq_bar_vaddr); */
+	if (probe_ctx->cq_vaddr == NULL || probe_ctx->sq_vaddr == NULL || probe_ctx->rdbuff_vaddr == NULL || probe_ctx->wrbuff_vaddr == NULL) {
+		fprintf(stderr, "Virtual BAR adresses invalid!\n");
+		return -1;
+	}
+	if (probe_ctx->cq_paddr == 0 || probe_ctx->sq_paddr == 0 || probe_ctx->rdbuff_paddr == 0 || probe_ctx->wrbuff_paddr == 0) {
+		fprintf(stderr, "Physical BAR adresses invalid!\n");
+		return -2;
+	}
+	if (probe_ctx->cq_byte_size <= 0 || probe_ctx->sq_byte_size <= 0 || probe_ctx->rdbuff_byte_size <= 0 || probe_ctx->wrbuff_byte_size <= 0) {
+		fprintf(stderr, "BAR sizes invalid!\n");
+		return -3;
+	}
 
-	/* rc = spdk_mem_register((void *)mem_register_start, VALUE_2MB); */
-	/* if (rc) { */
-	/* 	SPDK_ERRLOG("spdk_mem_register() of CQ BAR failed\n"); */
-	/* 	return rc; */
-	/* } */
-
-	/* mem_register_start = _2MB_PAGE((uintptr_t)probe_ctx->data_bar_vaddr); */
-	/* /\* mem_register_end = CEIL_2MB((uintptr_t)probe_ctx->data_bar_vaddr + probe_ctx->data_bar_size); *\/ */
-	/* assert(mem_register_start == (uintptr_t)probe_ctx->data_bar_vaddr); */
-
-	/* rc = spdk_mem_register((void *)mem_register_start, VALUE_2MB); */
-	/* if (rc) { */
-	/* 	SPDK_ERRLOG("spdk_mem_register() of DATA failed\n"); */
-	/* 	rc = spdk_mem_unregister(probe_ctx->cq_bar_vaddr, VALUE_2MB); */
-	/* 	return rc; */
-	/* } */
+	/* printf("CQ BAR VADDR: %p\n", probe_ctx->cq_vaddr); */
+	/* printf("CQ BAR PADDR: %lx\n", probe_ctx->cq_paddr); */
+	/* printf("CQ BAR size:  %ld\n", probe_ctx->cq_byte_size); */
+	/* printf("DATA BAR VADDR: %p\n", probe_ctx->wrbuff_vaddr); */
+	/* printf("DATA BAR PADDR: %lx\n", probe_ctx->wrbuff_paddr); */
+	/* printf("DATA BAR size:  %ld\n", probe_ctx->wrbuff_byte_size); */
 
 	/* rc = spdk_pci_device_disable_interrupts(pci_dev); */
 	/* if (rc) { */
@@ -777,10 +836,7 @@ main(int argc, char **argv)
 	// Assign default attributes
 	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
 	ctx.trid = &trid;
-	ctx.lba_num = 1;
-	ctx.contiguous_dispatch = false;
 	ctx.qsize = 0;
-	ctx.cmds_to_disp = 0;
 	ctx.select_dev = "0";
 
 	opts.opts_size = sizeof(opts);
@@ -788,11 +844,6 @@ main(int argc, char **argv)
 	rc = parse_args(argc, argv, &opts, &ctx);
 	if (rc != 0) {
 		return rc;
-	}
-
-	if (ctx.cmds_to_disp == 0 && !ctx.contiguous_dispatch) {
-		fprintf(stderr, "Specify the amount of commands to dispatch or enable contiguous dispatch\n");
-		return -1;
 	}
 
 	opts.name = "fpga_zero_copy";
@@ -814,18 +865,21 @@ main(int argc, char **argv)
 		goto nvme_probe_fail;
 	}
 
-	if (!ctrl_rst_done) {
+	if (do_ctrl_rst) {
 		printf("Resetting controller...");
 		if (spdk_nvme_ctrlr_reset(g_controller.ctrlr)) {
 			fprintf(stderr, "Failed to reset controller!");
 			rc = -11;
-			goto ctrlr_reset_fail;
 		}
+		goto ctrlr_reset_fail;
+	}
+
+	if (do_subs_rst) {
 		if (spdk_nvme_ctrlr_reset_subsystem(g_controller.ctrlr)) {
 			fprintf(stderr, "Failed to reset subsystem!");
 			rc = -12;
-			goto ctrlr_reset_fail;
 		}
+		goto ctrlr_reset_fail;
 	}
 
 	ncd_driver = spdk_pci_get_driver("ncd");
@@ -857,16 +911,18 @@ main(int argc, char **argv)
 
 	printf("PCIE domain initialization complete\n");
 	printf("NCD PCIe device context:\n");
-	printf("\tSQ BAR VADDR: %p\n", ctx.sq_bar_vaddr);
-	printf("\tSQ BAR PADDR: %lx\n", ctx.sq_bar_paddr);
-	printf("\tSQ BAR size:  %ld\n", ctx.sq_bar_size);
-	printf("\tCQ BAR VADDR: %p\n", ctx.cq_bar_vaddr);
-	printf("\tCQ BAR PADDR: %lx\n", ctx.cq_bar_paddr);
-	printf("\tCQ BAR size:  %ld\n", ctx.cq_bar_size);
-	printf("\tDATA BAR VADDR: %p\n", ctx.data_bar_vaddr);
-	printf("\tDATA BAR PADDR: %lx\n", ctx.data_bar_paddr);
-	printf("\tDATA BAR size:  %ld\n", ctx.data_bar_size);
-	/* *(uint64_t *) ctx.cq_bar_vaddr = 0x1248; */
+	printf("\tSQ VADDR: %p\n", ctx.sq_vaddr);
+	printf("\tSQ PADDR: %lx\n", ctx.sq_paddr);
+	printf("\tSQ size:  %ld bytes\n", ctx.sq_byte_size);
+	printf("\tCQ VADDR: %p\n", ctx.cq_vaddr);
+	printf("\tCQ PADDR: %lx\n", ctx.cq_paddr);
+	printf("\tCQ size:  %ld bytes\n", ctx.cq_byte_size);
+	printf("\tWRBUFF VADDR: %p\n", ctx.wrbuff_vaddr);
+	printf("\tWRBUFF PADDR: %lx\n", ctx.wrbuff_paddr);
+	printf("\tWRBUFF size:  %ld bytes\n", ctx.wrbuff_byte_size);
+	printf("\tRDBUFF VADDR: %p\n", ctx.rdbuff_vaddr);
+	printf("\tRDBUFF PADDR: %lx\n", ctx.rdbuff_paddr);
+	printf("\tRDBUFF size:  %ld bytes\n", ctx.rdbuff_byte_size);
 
 	rc = queues_alloc(&ctx);
 	if (rc) {
@@ -908,41 +964,32 @@ main(int argc, char **argv)
 	}
 
 	// Can be commented out if we want to keep statistics between runs
-	nfb_comp_write64(dma_ctx.comp, REG_LBA_SPACE_SIZE, 0x000000000FFFFFFF);
-	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_CNTRS_RST | CTRL_RD_EN);
-	nfb_comp_write32(dma_ctx.comp, REG_CMDS_TO_DISP_CNTR_LOAD, ctx.cmds_to_disp);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_RPT_UPD_EN | CTRL_ENABLE);
 	usleep(1);
-
-	uint32_t regval = CTRL_CQE_PROC_EN | CTRL_SEQV_RW | CTRL_RD_EN | CTRL_LOAD_CNTR | CTRL_RPT_UPD_EN;
-	if (ctx.contiguous_dispatch)
-		regval |= CTRL_CONTIG_DISP;
-	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, regval);
-	printf("NCD run to generate commands (READ of %u LBAs), contiguous_dispatch: %d\n", ctx.lba_num, ctx.contiguous_dispatch);
 
 	signal(SIGINT, sig_usr);
 	signal(SIGTERM, sig_usr);
 
 	usleep(1000);
-	spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
+	//spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
 
-	while (!stop && ctx.contiguous_dispatch) usleep(10000);
+	while (!stop) usleep(10000);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, 0);
 
-	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_CQE_PROC_EN | CTRL_SEQV_RW | CTRL_RD_EN | CTRL_RPT_UPD_EN);
-	printf("Stopping NCD generator\n");
-
-	while (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL))
+	while (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL) &&
+		(nfb_comp_read8(dma_ctx.comp, REG_STATUS) & 0x1) == 0) {
 		usleep(1000000);
+	}
 
-	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
+	dma_ctrl_deinit(&ctx, &dma_ctx);
 
-	nfb_comp_close(dma_ctx.comp);
+	rd_ctrl_regs(g_namespace.ctrlr);
+
 /* buf_alloc_fail: */
 dma_ctrl_alloc_fail:
 	queues_dealloc(&ctx);
 	printf("Qeues dealloced\n");
 queue_alloc_fail:
-	/* spdk_mem_unregister(ctx.data_bar_vaddr, VALUE_2MB); */
-	/* spdk_mem_unregister(ctx.cq_bar_vaddr, VALUE_2MB); */
 	spdk_pci_device_detach(ctx.dev);
 	printf("Pcie dev detached\n");
 	/* fflush(stdout); */
