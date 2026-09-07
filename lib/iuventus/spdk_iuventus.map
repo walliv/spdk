@@ -1,0 +1,15 @@
+{
+	global:
+	iuventus_opts_init;
+	iuventus_usage;
+	iuventus_parse_args;
+	iuventus_init;
+	iuventus_enable;
+	iuventus_disable;
+	iuventus_drain;
+	iuventus_fini;
+	iuventus_num_peers;
+	iuventus_peer;
+
+	local: *;
+};
