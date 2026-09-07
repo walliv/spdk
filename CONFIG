@@ -119,6 +119,10 @@ CONFIG_DAOS_DIR=
 # Build UBLK support
 CONFIG_UBLK=n
 
+# Build the DMA Iuventus environment library
+# Requires libnfb and libfdt development libraries
+CONFIG_IUVENTUS=n
+
 # Build vhost library.
 CONFIG_VHOST=y
 

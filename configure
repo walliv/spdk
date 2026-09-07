@@ -84,6 +84,8 @@ function usage() {
 	echo " --without-rbd             No path required."
 	echo " --with-ublk               Build ublk library."
 	echo " --without-ublk            No path required."
+	echo " --with-iuventus           Build the DMA Iuventus environment library."
+	echo " --without-iuventus        No path required."
 	echo " --with-rdma[=PROVIDER]    Build RDMA transport for NVMf target and initiator."
 	echo " --without-rdma            Accepts optional RDMA provider name. Can be \"verbs\" or \"mlx5_dv\"."
 	echo "                           If no provider specified, \"verbs\" provider is used by default."
@@ -463,6 +465,12 @@ for i in "$@"; do
 			;;
 		--without-ublk)
 			CONFIG[UBLK]=n
+			;;
+		--with-iuventus)
+			CONFIG[IUVENTUS]=y
+			;;
+		--without-iuventus)
+			CONFIG[IUVENTUS]=n
 			;;
 		--with-rbd)
 			CONFIG[RBD]=y
@@ -1073,6 +1081,16 @@ if [[ "${CONFIG[UBLK]}" = "y" ]]; then
 		'int main(void) { return 0; }\n' \
 		| "${BUILD_CMD[@]}" -luring - 2> /dev/null; then
 		echo "--with-ublk requires liburing and ublk_drv."
+		echo "Please install then re-run this script."
+		exit 1
+	fi
+fi
+
+if [[ "${CONFIG[IUVENTUS]}" = "y" ]]; then
+	if ! echo -e '#include <nfb/nfb.h>\n#include <libfdt.h>\n' \
+		'int main(void) { return 0; }\n' \
+		| "${BUILD_CMD[@]}" -lnfb -lfdt - 2> /dev/null; then
+		echo "--with-iuventus requires libnfb and libfdt."
 		echo "Please install then re-run this script."
 		exit 1
 	fi

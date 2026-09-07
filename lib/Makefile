@@ -16,6 +16,9 @@ DIRS-y += nbd ftl vfio_user
 ifeq ($(CONFIG_UBLK),y)
 DIRS-y += ublk
 endif
+ifeq ($(CONFIG_IUVENTUS),y)
+DIRS-y += iuventus
+endif
 endif
 
 # The ut library is used by unit tests and some functional tests, so build it only when either of

@@ -76,6 +76,9 @@ DEPDIRS-nbd := log util thread $(JSON_LIBS) bdev
 ifeq ($(CONFIG_UBLK),y)
 DEPDIRS-ublk := log util thread $(JSON_LIBS) bdev
 endif
+ifeq ($(CONFIG_IUVENTUS),y)
+DEPDIRS-iuventus := log util nvme
+endif
 DEPDIRS-nvmf := accel log sock util nvme thread $(JSON_LIBS) trace bdev keyring
 ifeq ($(CONFIG_RDMA),y)
 DEPDIRS-nvmf += rdma_provider rdma_utils
