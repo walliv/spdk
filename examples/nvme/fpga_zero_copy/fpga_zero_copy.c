@@ -31,21 +31,43 @@
 
 #define DATA_BUFFER_STRING "Dan Kriz je best!"
 
-#define REG_CONTROL             0x00
-#define REG_STATUS              0x04
-#define REG_SQTDBL              0x08
-#define REG_SQHDBL              0x0C
-#define REG_CQHDBL              0x10
-#define REG_DBL_MASK            0x14
-#define REG_SQTDBL_BADDR        0x18
-#define REG_CQHDBL_BADDR        0x20
-#define REG_RDBUFF_BADDR        0x28
-#define REG_RDBUFF_PRP_LIST_PTR 0x30
-#define REG_WRBUFF_BADDR        0x38
-#define REG_WRBUFF_PRP_LIST_PTR 0x40
-#define REG_LBA_NUM_MASK        0x98
-#define REG_LBA_SPACE_SIZE      0xD4
-#define REG_META_PTR 			0x10C
+#define REG_CONTROL             0x000
+#define REG_STATUS              0x004
+/* COMMON block: single, shared across queues (data pool + metadata). */
+#define REG_RDBUFF_BADDR        0x008
+#define REG_RDBUFF_PRP_LIST_PTR 0x010
+#define REG_WRBUFF_BADDR        0x018
+#define REG_WRBUFF_PRP_LIST_PTR 0x020
+#define REG_META_PTR            0x028
+/* Multi-queue: flat pages 0..NUM_QUEUES-1 hold the queues; data pool starts at page 4 (N=4). */
+/* The FPGA reserves no pages, so its page 0 is data page 0: SQ and CQ live in their own BARs
+ * rather than at the head of the data pool. */
+#define FIRST_DATA_PAGE         0
+/* Must match the page count the FPGA is built with. The FPGA indexes its PRP list as
+ * base + page_idx*8 over this whole range, so the list has to be this many entries or it
+ * reads past the allocation -- silently, since the SSD just gets whatever follows in the
+ * hugepage. */
+#define MANAGED_PAGES           512
+/* NVMe 2.0e 4.1.2 confines a PRP List to ONE memory page and reaches any further page only
+ * through a chain pointer in that page's last entry. MANAGED_PAGES is chosen so the whole
+ * list fits one page, which keeps it flat and chain-free; the FPGA emits no chain pointers,
+ * so the assert is what stops the two drifting apart. */
+#define PRP_LIST_BYTES          (MANAGED_PAGES * 8)
+_Static_assert(PRP_LIST_BYTES <= VALUE_4KB,
+	       "PRP list must fit one memory page: the FPGA emits no NVMe chain pointers");
+/* PER-QUEUE 2D block: queue q's registers at PER_Q_BASE + q*PER_Q_STRIDE + field offset. */
+#define PER_Q_BASE              0x200
+#define PER_Q_STRIDE            0x040
+#define PQ_SQTDBL               0x00
+#define PQ_SQHDBL               0x04
+#define PQ_CQHDBL               0x08
+#define PQ_DBL_MASK             0x0C
+#define PQ_SQTDBL_BADDR         0x10
+#define PQ_CQHDBL_BADDR         0x18
+#define PQ_LBA_SPACE_SIZE       0x20
+#define PQ_NAMESPACE_ID         0x28
+#define PQ_LBA_NUM_MASK         0x2C
+#define PQ(q, off) (PER_Q_BASE + (uint32_t)(q) * PER_Q_STRIDE + (off))
 
 #define CTRL_ENABLE       (1 << 0)
 #define CTRL_RPT_UPD_EN   (1 << 4)
@@ -57,7 +79,9 @@
 #define SQ_BAR 0
 #define CQ_BAR 1
 #define WRBUFF_BAR 2
-#define RDBUFF_BAR 3
+/* BAR2 is a 64-bit BAR, so it consumes config-space registers 2 AND 3; RDBUFF is the next
+ * usable index, 4 (also 64-bit, consuming 4 and 5). */
+#define RDBUFF_BAR 4
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr	*ctrlr;
@@ -440,6 +464,22 @@ static struct spdk_thread    *g_host_thread = NULL;
 #define HOST_FS_MAX_THREADS 64
 static struct spdk_thread *g_all_threads[HOST_FS_MAX_THREADS];
 static int                 g_num_threads = 0;
+/* Doorbell repeat-update (RPT_UPD): OFF by default — re-writing an unchanged doorbell
+ * value is a NVMe "Invalid Doorbell Write Value" (spec Fig.144 cause #2). -R opts in. */
+static bool                g_rpt_upd_en = false;
+/* -Q<idx>: base FPGA queue this fzc instance drives; SQ[q]/CQ[q] at flat page q. */
+static int                 g_queue_idx = 0;
+/* -N<num>: number of FPGA queues to drive on this ONE SSD (multi-queue-to-one-SSD). Each gets its
+ * own NVMe I/O qpair on the same controller and its own flat page (g_queue_idx..g_queue_idx+N-1),
+ * all sharing the one RDBUFF/WRBUFF data pool. Default 1 = original single-queue behaviour. */
+#define MAX_QUEUES 8
+static int                 g_num_queues = 1;
+static int32_t             g_hw_qid[MAX_QUEUES];
+static uint64_t            g_sqtdbl_paddr[MAX_QUEUES];
+static uint64_t            g_cqhdbl_paddr[MAX_QUEUES];
+static bool                g_cq_created[MAX_QUEUES];
+static bool                g_sq_created[MAX_QUEUES];
+static bool                g_qid_alloc[MAX_QUEUES];
 
 /*
  * SPDK thread-library operation callback: called whenever a new SPDK
@@ -919,6 +959,22 @@ qop_complete_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
 	}
 }
 
+/* Log NVMe Asynchronous Event Notifications as they arrive (wedge diagnostics). */
+static void
+aer_cb(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	uint32_t r = cpl->cdw0;
+	uint8_t aet = r & 0x7;
+	uint8_t aei = (r >> 8) & 0xff;
+	uint8_t lid = (r >> 16) & 0xff;
+	const char *t = aet == 0 ? "Error" : aet == 1 ? "SMART/Health" :
+		aet == 2 ? "Notice" : aet == 3 ? "Immediate" : aet == 6 ? "IoCmdSet" :
+		aet == 7 ? "Vendor" : "?";
+	printf(">>> AEN cdw0=0x%08x type=%u(%s) info=0x%02x logpage=0x%02x sct=%u sc=%u <<<\n",
+		r, aet, t, aei, lid, cpl->status.sct, cpl->status.sc);
+	fflush(stdout);
+}
+
 static int
 submit_admin_request(struct spdk_nvme_cmd *cmd, const char *cmd_name)
 {
@@ -1080,6 +1136,9 @@ dump_nvme_logs(const char *tag)
 	fflush(stdout);
 }
 
+static void queues_delete(struct fpga_hw_ctx *hw);
+static void queues_dealloc(struct fpga_hw_ctx *hw);
+
 static int
 queues_alloc(struct app_ctx *app_ctx)
 {
@@ -1103,115 +1162,104 @@ queues_alloc(struct app_ctx *app_ctx)
 
 	hw->doorbell_mask = qopts.io_queue_size - 1;
 
-	qopts.sq.vaddr = hw->sq.vaddr;
-	qopts.sq.paddr = hw->sq.paddr;
-	qopts.sq.buffer_size = qopts.io_queue_size * sizeof(struct spdk_nvme_cmd);
+	/* Create g_num_queues NVMe I/O qpairs on this one controller, each with its SQ/CQ in the
+	 * FPGA BAR at flat page (g_queue_idx + q). All share the one RDBUFF/WRBUFF data pool. */
+	for (int q = 0; q < g_num_queues; q++) {
+		int      page     = g_queue_idx + q;
+		void    *sq_vaddr = (uint8_t *)hw->sq.vaddr + (uint64_t)page * VALUE_4KB;
+		uint64_t sq_paddr = hw->sq.paddr + (uint64_t)page * VALUE_4KB;
+		void    *cq_vaddr = (uint8_t *)hw->cq.vaddr + (uint64_t)page * VALUE_4KB;
+		uint64_t cq_paddr = hw->cq.paddr + (uint64_t)page * VALUE_4KB;
 
-	qopts.cq.vaddr = hw->cq.vaddr;
-	qopts.cq.paddr = hw->cq.paddr;
-	qopts.cq.buffer_size = qopts.io_queue_size * sizeof(struct spdk_nvme_cpl);
+		qopts.sq.vaddr = sq_vaddr;
+		qopts.sq.paddr = sq_paddr;
+		qopts.sq.buffer_size = qopts.io_queue_size * sizeof(struct spdk_nvme_cmd);
+		qopts.cq.vaddr = cq_vaddr;
+		qopts.cq.paddr = cq_paddr;
+		qopts.cq.buffer_size = qopts.io_queue_size * sizeof(struct spdk_nvme_cpl);
 
-	// Reset the Completion Queue in the Hardware, otherwise previous completion entries get
-	// detected. This means return Phase Tags to value 0 (i.e. default value)
-	uint8_t *cpl_buff = hw->cq.vaddr;
-	for (uint32_t i = 14; i < qopts.cq.buffer_size; i+=sizeof(struct spdk_nvme_cpl)) {
-		cpl_buff[i] = 0;
+		/* Clear this CQ before the drive can post into it. Every byte, not just the phase tag
+		 * at offset 14: a sparse byte write is a read-modify-write and this BAR does not
+		 * support reads, so the narrow form never landed. */
+		uint8_t *cpl_buff = cq_vaddr;
+		for (uint32_t i = 0; i < qopts.cq.buffer_size; i++) {
+			cpl_buff[i] = 0;
+		}
+
+		int32_t qid = spdk_nvme_ctrlr_alloc_qid(g_namespace.ctrlr);
+		if (qid < 0) {
+			printf("ERROR: Failed to allocate QID for HW queue %d\n", q);
+			rc = -13;
+			goto fail;
+		}
+		g_hw_qid[q]       = qid;
+		g_qid_alloc[q]    = true;
+		g_sqtdbl_paddr[q] = hw->doorbell_base + (2 * qid)     * (4 << hw->doorbell_stride);
+		g_cqhdbl_paddr[q] = hw->doorbell_base + (2 * qid + 1) * (4 << hw->doorbell_stride);
+		printf("HW queue %d -> NVMe qid %d, flat page %d\n", q, qid, page);
+
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc = SPDK_NVME_OPC_CREATE_IO_CQ;
+		cmd.nsid = 0;
+		cmd.cdw10_bits.create_io_q.qid   = qid;
+		cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
+		cmd.cdw11_bits.create_io_cq.pc   = 1;
+		cmd.dptr.prp.prp1 = cq_paddr;
+		rc = submit_admin_request(&cmd, "CQ_CREATE");
+		if (rc) { printf("Failed CQ_CREATE (q%d)!\n", q); goto fail; }
+		g_cq_created[q] = true;
+
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.opc = SPDK_NVME_OPC_CREATE_IO_SQ;
+		cmd.nsid = 0;
+		cmd.cdw10_bits.create_io_q.qid    = qid;
+		cmd.cdw10_bits.create_io_q.qsize  = qopts.io_queue_size - 1;
+		cmd.cdw11_bits.create_io_sq.pc    = 1;
+		cmd.cdw11_bits.create_io_sq.qprio = 2;
+		cmd.cdw11_bits.create_io_sq.cqid  = qid;
+		cmd.dptr.prp.prp1 = sq_paddr;
+		rc = submit_admin_request(&cmd, "SQ_CREATE");
+		if (rc) { printf("Failed SQ_CREATE (q%d)!\n", q); goto fail; }
+		g_sq_created[q] = true;
 	}
 
-	g_namespace.hw_qid = spdk_nvme_ctrlr_alloc_qid(g_namespace.ctrlr);
-	if (g_namespace.hw_qid < 0) {
-		printf("ERROR: Failed to allocated QID for the HW queues\n");
-		rc = -13;
-		goto qid_alloc_fail;
-
-	}
-	hw->qid_allocated = true;
-
-	hw->sqtdbl_paddr = hw->doorbell_base + (2 * g_namespace.hw_qid) * (4 << hw->doorbell_stride);
-	hw->cqhdbl_paddr = hw->doorbell_base + (2 * g_namespace.hw_qid + 1) * (4 << hw->doorbell_stride);
-
-	printf("Allocate qid %d\n", g_namespace.hw_qid);
-
-	cmd.opc = SPDK_NVME_OPC_CREATE_IO_CQ;
-	cmd.nsid = 0;
-	cmd.cdw10_bits.create_io_q.qid = g_namespace.hw_qid;
-	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
-	cmd.cdw11_bits.create_io_cq.pc = 1;
-	cmd.dptr.prp.prp1 = hw->cq.paddr;
-
-	rc = submit_admin_request(&cmd, "CQ_CREATE");
-	if (rc) {
-		printf("Failed to submit the Admin command!\n");
-		goto cq_create_fail;
-	}
-	hw->cq_created = true;
-
-	printf("HW CQ allocated!\n");
-
-	cmd.opc = SPDK_NVME_OPC_CREATE_IO_SQ;
-	cmd.nsid = 0;
-	cmd.cdw10_bits.create_io_q.qid = g_namespace.hw_qid;
-	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
-	cmd.cdw11_bits.create_io_sq.pc = 1;
-	cmd.cdw11_bits.create_io_sq.qprio = 2;
-	cmd.cdw11_bits.create_io_sq.cqid = g_namespace.hw_qid;
-	cmd.dptr.prp.prp1 = hw->sq.paddr;
-
-	rc = submit_admin_request(&cmd, "SQ_CREATE");
-	if (rc) {
-		printf("Failed to submit the Admin command!\n");
-		goto sq_create_fail;
-	}
-	hw->sq_created = true;
-
-	printf("HW SQ allocated!\n");
-
+	/* Legacy single-queue prints/teardown reference these; keep them pointing at queue 0. */
+	g_namespace.hw_qid = g_hw_qid[0];
+	hw->qid_allocated  = true;
+	hw->sqtdbl_paddr   = g_sqtdbl_paddr[0];
+	hw->cqhdbl_paddr   = g_cqhdbl_paddr[0];
+	printf("%d HW queue(s) allocated on the controller.\n", g_num_queues);
 	return 0;
 
-sq_create_fail:
-	if (hw->cq_created) {
-		cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
-		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-		rc = submit_admin_request(&cmd, "CQ_DELETE");
-		if (rc) {
-			printf("Failed to submit the Admin command!\n");
-		}
-		hw->cq_created = false;
-	}
-
-cq_create_fail:
-	if (hw->qid_allocated) {
-		spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
-		hw->qid_allocated = false;
-		g_namespace.hw_qid = -1;
-	}
-qid_alloc_fail:
+fail:
+	queues_dealloc(hw);
 	return rc;
 }
 
 static void queues_delete(struct fpga_hw_ctx *hw)
 {
-	int rc = 0;
-	struct spdk_nvme_cmd cmd = {0};
+	(void)hw;
+	struct spdk_nvme_cmd cmd;
 
-	if (hw->sq_created) {
-		cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
-		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-		rc = submit_admin_request(&cmd, "SQ_DELETE");
-		if (rc) {
-			printf("Failed to submit Admin command!\n");
+	for (int q = 0; q < g_num_queues; q++) {
+		if (g_sq_created[q]) {
+			memset(&cmd, 0, sizeof(cmd));
+			cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
+			cmd.cdw10_bits.delete_io_q.qid = g_hw_qid[q];
+			if (submit_admin_request(&cmd, "SQ_DELETE")) {
+				printf("Failed SQ_DELETE (q%d)!\n", q);
+			}
+			g_sq_created[q] = false;
 		}
-		hw->sq_created = false;
-	}
-
-	if (hw->cq_created) {
-		cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
-		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-		rc = submit_admin_request(&cmd, "CQ_DELETE");
-		if (rc) {
-			printf("Failed to submit the Admin command!\n");
+		if (g_cq_created[q]) {
+			memset(&cmd, 0, sizeof(cmd));
+			cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
+			cmd.cdw10_bits.delete_io_q.qid = g_hw_qid[q];
+			if (submit_admin_request(&cmd, "CQ_DELETE")) {
+				printf("Failed CQ_DELETE (q%d)!\n", q);
+			}
+			g_cq_created[q] = false;
 		}
-		hw->cq_created = false;
 	}
 }
 
@@ -1219,11 +1267,15 @@ static void
 queues_dealloc(struct fpga_hw_ctx *hw)
 {
 	queues_delete(hw);
-	if (hw->qid_allocated) {
-		spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
-		hw->qid_allocated = false;
-		g_namespace.hw_qid = -1;
+	for (int q = 0; q < g_num_queues; q++) {
+		if (g_qid_alloc[q]) {
+			spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_hw_qid[q]);
+			g_qid_alloc[q] = false;
+			g_hw_qid[q] = -1;
+		}
 	}
+	hw->qid_allocated = false;
+	g_namespace.hw_qid = -1;
 }
 
 static bool
@@ -1309,6 +1361,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	}
 
 	g_namespace.ctrlr = ctrlr;
+	spdk_nvme_ctrlr_register_aer_callback(ctrlr, aer_cb, NULL);
 	g_namespace.ns = ns;
 	sect_size = spdk_nvme_ns_get_sector_size(ns);
 
@@ -1403,14 +1456,14 @@ dev_open_fail:
 
 static int prp_list_alloc(struct fpga_hw_ctx *hw)
 {
-	uint64_t size = VALUE_4KB;
-	hw->wrbuff_prp_list.vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
+	uint64_t size = PRP_LIST_BYTES;
+	hw->wrbuff_prp_list.vaddr = spdk_dma_zmalloc(PRP_LIST_BYTES, VALUE_4KB, NULL);
 	if (hw->wrbuff_prp_list.vaddr == NULL) {
 		fprintf(stderr, "ERROR: Write PRP list allocation failed\n");
 		return -1;
 	}
 
-	hw->rdbuff_prp_list.vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
+	hw->rdbuff_prp_list.vaddr = spdk_dma_zmalloc(PRP_LIST_BYTES, VALUE_4KB, NULL);
 	if (hw->rdbuff_prp_list.vaddr == NULL) {
 		fprintf(stderr, "ERROR: Read PRP list allocation failed\n");
 		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
@@ -1428,8 +1481,8 @@ static int prp_list_alloc(struct fpga_hw_ctx *hw)
 		return -3;
 	}
 
-	if (size != VALUE_4KB) {
-		fprintf(stderr, "ERROR: Write PRP list buffer size is not 4096 bytes (detected size: %lu)\n", size);
+	if (size != PRP_LIST_BYTES) {
+		fprintf(stderr, "ERROR: Write PRP list buffer is not physically contiguous over PRP_LIST_BYTES (detected size: %lu)\n", size);
 		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
 		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
 		hw->wrbuff_prp_list.vaddr = NULL;
@@ -1447,8 +1500,8 @@ static int prp_list_alloc(struct fpga_hw_ctx *hw)
 		return -5;
 	}
 
-	if (size != VALUE_4KB) {
-		fprintf(stderr, "ERROR: Read PRP list buffer size is not 4096 bytes (detected size: %lu)\n", size);
+	if (size != PRP_LIST_BYTES) {
+		fprintf(stderr, "ERROR: Read PRP list buffer is not physically contiguous over PRP_LIST_BYTES (detected size: %lu)\n", size);
 		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
 		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
 		hw->wrbuff_prp_list.vaddr = NULL;
@@ -1456,9 +1509,27 @@ static int prp_list_alloc(struct fpga_hw_ctx *hw)
 		return -6;
 	}
 
-	for (int i = 1; i < (int)(hw->wrbuff.size / VALUE_4KB); i++) {
-		((uint64_t *)hw->wrbuff_prp_list.vaddr)[i - 1] = hw->wrbuff.paddr + (i * VALUE_4KB);
-		((uint64_t *)hw->rdbuff_prp_list.vaddr)[i - 1] = hw->rdbuff.paddr + (i * VALUE_4KB);
+	/* The FPGA can hand out any page in [0, MANAGED_PAGES), so every entry must be valid.
+	 * A buffer BAR smaller than that would let it address past the window -- refuse rather
+	 * than leave zeroed entries pointing at physical address 0. */
+	if (hw->wrbuff.size < (uint64_t)MANAGED_PAGES * VALUE_4KB ||
+	    hw->rdbuff.size < (uint64_t)MANAGED_PAGES * VALUE_4KB) {
+		fprintf(stderr,
+			"ERROR: data BARs too small for %d managed pages (wrbuff %llu B, rdbuff %llu B, "
+			"need %llu B each)\n",
+			MANAGED_PAGES, (unsigned long long)hw->wrbuff.size,
+			(unsigned long long)hw->rdbuff.size,
+			(unsigned long long)MANAGED_PAGES * VALUE_4KB);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
+		return -7;
+	}
+
+	for (int i = FIRST_DATA_PAGE; i < MANAGED_PAGES; i++) {
+		((uint64_t *)hw->wrbuff_prp_list.vaddr)[i - FIRST_DATA_PAGE] = hw->wrbuff.paddr + ((uint64_t)i * VALUE_4KB);
+		((uint64_t *)hw->rdbuff_prp_list.vaddr)[i - FIRST_DATA_PAGE] = hw->rdbuff.paddr + ((uint64_t)i * VALUE_4KB);
 	}
 	hw->prp_lists_allocated = true;
 
@@ -1483,12 +1554,12 @@ static void prp_list_free(struct fpga_hw_ctx *hw)
 static void prp_list_print(const struct fpga_hw_ctx *hw)
 {
 	printf("Write PRP List (vaddr: %p, paddr: 0x%lx):\n", hw->wrbuff_prp_list.vaddr, hw->wrbuff_prp_list.paddr);
-	for (int i = 0; i < (int)(hw->wrbuff.size / VALUE_4KB) - 1; i++) {
+	for (int i = 0; i < MANAGED_PAGES - FIRST_DATA_PAGE; i++) {
 		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)hw->wrbuff_prp_list.vaddr)[i]);
 	}
 
 	printf("Read PRP List (vaddr: %p, paddr: 0x%lx):\n", hw->rdbuff_prp_list.vaddr, hw->rdbuff_prp_list.paddr);
-	for (int i = 0; i < (int)(hw->rdbuff.size / VALUE_4KB) - 1; i++) {
+	for (int i = 0; i < MANAGED_PAGES - FIRST_DATA_PAGE; i++) {
 		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)hw->rdbuff_prp_list.vaddr)[i]);
 	}
 }
@@ -1512,16 +1583,23 @@ static int dma_ctrl_init(struct fpga_hw_ctx *hw, struct dma_device_ctx *dma_ctx)
 		goto prp_alloc_fail;
 	}
 
-	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, hw->doorbell_mask);
-	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BADDR, hw->sqtdbl_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BADDR, hw->cqhdbl_paddr);
+	/* COMMON (shared data pool + metadata) */
 	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_BADDR, hw->rdbuff.paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_PRP_LIST_PTR, hw->rdbuff_prp_list.paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_BADDR, hw->wrbuff.paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_PRP_LIST_PTR, hw->wrbuff_prp_list.paddr);
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_NUM_MASK, hw->lba_num_mask);
-	nfb_comp_write64(dma_ctx->comp, REG_LBA_SPACE_SIZE, hw->lba_space_size);
 	nfb_comp_write64(dma_ctx->comp, REG_META_PTR, 0);
+	/* PER-QUEUE registers: one block per FPGA queue this instance drives (flat page g_queue_idx+q).
+	 * Each queue points at its own NVMe SQ-tail / CQ-head doorbell on the shared controller. */
+	for (int q = 0; q < g_num_queues; q++) {
+		int page = g_queue_idx + q;
+		nfb_comp_write16(dma_ctx->comp, PQ(page, PQ_DBL_MASK), hw->doorbell_mask);
+		nfb_comp_write64(dma_ctx->comp, PQ(page, PQ_SQTDBL_BADDR), g_sqtdbl_paddr[q]);
+		nfb_comp_write64(dma_ctx->comp, PQ(page, PQ_CQHDBL_BADDR), g_cqhdbl_paddr[q]);
+		nfb_comp_write64(dma_ctx->comp, PQ(page, PQ_LBA_SPACE_SIZE), hw->lba_space_size);
+		nfb_comp_write16(dma_ctx->comp, PQ(page, PQ_LBA_NUM_MASK), hw->lba_num_mask);
+		nfb_comp_write32(dma_ctx->comp, PQ(page, PQ_NAMESPACE_ID), 1);
+	}
 	return 0;
 
 prp_alloc_fail:
@@ -1584,7 +1662,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct app_ctx
 {
 	int op, rc;
 
-	while ((op = getopt(argc, argv, "s:i:gm:L:hrt:cq:p:d:")) != -1) {
+	while ((op = getopt(argc, argv, "s:i:gm:L:hrt:cq:p:d:RQ:N:")) != -1) {
 		switch (op) {
 		case 'd':
 			ctx->select_dev = optarg;
@@ -1640,6 +1718,30 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct app_ctx
 		case 'r':
 			do_ctrl_rst = true;
 			break;
+		case 'Q':
+			g_queue_idx = spdk_strtol(optarg, 10);
+			if (g_queue_idx < 0) {
+				fprintf(stderr, "Invalid queue index\n");
+				return 1;
+			}
+			break;
+		case 'N':
+			/* Exactly one hardware queue pair per SSD. Several queues on one controller share
+			 * that drive's completion path while the FPGA still accounts per queue, so every
+			 * per-queue throughput/latency figure stops attributing to a device. Run one fzc
+			 * instance per drive, each with its own -Q index and traddr, instead. */
+			g_num_queues = spdk_strtol(optarg, 10);
+			if (g_num_queues != 1) {
+				fprintf(stderr,
+					"-N %s rejected: exactly one queue pair per SSD is supported.\n"
+					"Start one fzc instance per drive with distinct -Q and traddr.\n",
+					optarg);
+				return 1;
+			}
+			break;
+		case 'R':
+			g_rpt_upd_en = true;
+			break;
 		default:
 			usage(argv[0]);
 			return 1;
@@ -1678,17 +1780,26 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &hw->wrbuff.vaddr, &hw->wrbuff.paddr, &hw->wrbuff.size);
+	/* Four separate regions, one per logical BAR: SQ and CQ in their own 16 KB BARs, and the
+	 * data buffers in their own 1 GB 64-bit BARs. They are NOT aliases of the queue BARs any
+	 * more -- the flat 2-BAR layout is gone, so mapping them separately is what makes the
+	 * FPGA's page index and this app's addresses agree. */
+	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &hw->wrbuff.vaddr, &hw->wrbuff.paddr,
+				     &hw->wrbuff.size);
 	if (rc) {
-		fprintf(stderr, "Unable to map BAR %d (WR buffer)\n", WRBUFF_BAR);
+		fprintf(stderr, "Unable to map BAR %d (WRBUFF)\n", WRBUFF_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &hw->rdbuff.vaddr, &hw->rdbuff.paddr, &hw->rdbuff.size);
+	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &hw->rdbuff.vaddr, &hw->rdbuff.paddr,
+				     &hw->rdbuff.size);
 	if (rc) {
-		fprintf(stderr, "Unable to map BAR %d (RD buffer)\n", RDBUFF_BAR);
+		fprintf(stderr, "Unable to map BAR %d (RDBUFF)\n", RDBUFF_BAR);
 		return rc;
 	}
+
+	/* queues_alloc() still places each of the g_num_queues queues at its own page inside the
+	 * SQ/CQ BARs (g_queue_idx + q); those BARs hold only queues now. */
 
 	if (hw->cq.vaddr == NULL || hw->sq.vaddr == NULL || hw->rdbuff.vaddr == NULL || hw->wrbuff.vaddr == NULL) {
 		fprintf(stderr, "Virtual BAR adresses invalid!\n");
@@ -1852,7 +1963,25 @@ main(int argc, char **argv)
 		rc = 0;
 	}
 
-	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_RPT_UPD_EN | CTRL_ENABLE);
+	/* Clear the WHOLE CQ BAR before enabling the core, bounded by hw->cq.size rather than by a
+	 * page constant: FIRST_DATA_PAGE became 0 when the flat 2-BAR layout was replaced by
+	 * dedicated SQ/CQ BARs, which silently turned the previous per-page loop into dead code.
+	 *
+	 * A queue this instance does not create still holds the previous run's CQEs, and the core
+	 * does not clear that queue's doorbell mask on restart, so it stays un-vetoed and is still
+	 * polled. Its phase resets to 1 and those stale CQEs carry phase 1, so they are consumed as
+	 * completions with no dispatch: each returns a CID and frees a page that was never
+	 * allocated, until the core stops granting.
+	 *
+	 * Every byte, not just the phase tag at offset 14: a sparse byte write is a read-modify-write
+	 * and this BAR does not support reads, so the narrow form never landed. Unconditional: a core
+	 * left enabled by a previous run is the case that needs clearing most. */
+	uint8_t *cqbuf = (uint8_t *)hw->cq.vaddr;
+	for (size_t i = 0; i < hw->cq.size; i++) {
+		cqbuf[i] = 0;
+	}
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL,
+		(g_rpt_upd_en ? CTRL_RPT_UPD_EN : 0) | CTRL_ENABLE);
 	usleep(1);
 
 	signal(SIGINT, sig_usr);
@@ -1877,6 +2006,7 @@ main(int argc, char **argv)
 		for (i = 0; i < g_num_threads; i++) {
 			spdk_thread_poll(g_all_threads[i], 0, 0);
 		}
+		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
 		if (g_dumpreq) {
 			g_dumpreq = 0;
 			dump_nvme_logs("POST-WEDGE");
@@ -1885,13 +2015,24 @@ main(int argc, char **argv)
 	}
 	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, 0);
 
-	while (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL) &&
-		(nfb_comp_read8(dma_ctx.comp, REG_STATUS) & 0x1) == 0) {
-		usleep(1000000);
+	/* STATUS.READY (bit 0) stays high while the design quiesces (stops accepting new
+	 * reads; finishes any in-flight write to its EOF, then blocks) and drains every
+	 * outstanding P2P op, dropping only at full idle. Wait for that BEFORE deleting the
+	 * NVMe I/O queues below, else the SSD's in-flight fetches are stranded and its
+	 * controller state is corrupted. Whole-design READY covers all g_num_queues, unlike
+	 * the old per-queue-0 SQTDBL==SQHDBL check. Bounded (5 s) so a stuck drive cannot
+	 * hang teardown forever. */
+	for (int drain_i = 0; drain_i < 5000 &&
+	     (nfb_comp_read8(dma_ctx.comp, REG_STATUS) & 0x1) != 0; drain_i++) {
+		usleep(1000);
+	}
+	if ((nfb_comp_read8(dma_ctx.comp, REG_STATUS) & 0x1) != 0) {
+		fprintf(stderr, "WARNING: design did not drain within 5 s; "
+		                "tearing down anyway\n");
 	}
 
 	/* Tear down the host filesystem before any lower-level cleanup. */
-	host_fs_fini();
+	/* host_fs_fini(); ublk/host-fs teardown DISABLED for P2P counter test */
 
 	dma_ctrl_deinit(hw, &dma_ctx);
 
