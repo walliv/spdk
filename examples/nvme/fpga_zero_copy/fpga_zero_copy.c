@@ -100,10 +100,25 @@ struct nvme_host_io_channel {
 	struct spdk_poller    *poller;
 };
 
+/*
+ * SGL iterator state used by readv/writev path.
+ * Stored per submitted bdev_io and freed in completion callback.
+ */
+struct nvme_host_sgl_ctx {
+	struct spdk_bdev_io *bdev_io;
+	struct iovec        *iovs;
+	int                  iovcnt;
+	int                  iovpos;
+	uint32_t             iov_offset;
+};
+
 /* Forward declarations. */
 static int  nvme_host_module_init(void);
 static void nvme_host_bdev_submit_request(struct spdk_io_channel *ch,
 					  struct spdk_bdev_io *bdev_io);
+static void nvme_host_read_get_buf_cb(struct spdk_io_channel *ch,
+				      struct spdk_bdev_io *bdev_io,
+				      bool success);
 static bool nvme_host_bdev_io_type_supported(void *ctx,
 					     enum spdk_bdev_io_type io_type);
 static struct spdk_io_channel *nvme_host_bdev_get_io_channel(void *ctx);
@@ -135,26 +150,162 @@ nvme_host_io_cb(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 }
 
 static void
+nvme_host_sgl_reset(void *cb_arg, uint32_t offset)
+{
+	struct nvme_host_sgl_ctx *sgl_ctx = cb_arg;
+	struct iovec *iov;
+
+	/* Position iterator to the SGL element containing byte offset. */
+	sgl_ctx->iov_offset = offset;
+	for (sgl_ctx->iovpos = 0; sgl_ctx->iovpos < sgl_ctx->iovcnt; sgl_ctx->iovpos++) {
+		iov = &sgl_ctx->iovs[sgl_ctx->iovpos];
+		if (sgl_ctx->iov_offset < iov->iov_len) {
+			break;
+		}
+
+		sgl_ctx->iov_offset -= iov->iov_len;
+	}
+}
+
+static int
+nvme_host_sgl_next(void *cb_arg, void **address, uint32_t *length)
+{
+	struct nvme_host_sgl_ctx *sgl_ctx = cb_arg;
+	struct iovec *iov;
+
+	/* Signal malformed request if iterator is out of bounds. */
+	if (sgl_ctx->iovpos >= sgl_ctx->iovcnt) {
+		return -EINVAL;
+	}
+
+	/* Return current segment and apply intra-segment offset if needed. */
+	iov = &sgl_ctx->iovs[sgl_ctx->iovpos];
+	*address = iov->iov_base;
+	*length = iov->iov_len;
+
+	if (sgl_ctx->iov_offset) {
+		if (sgl_ctx->iov_offset > iov->iov_len) {
+			return -EINVAL;
+		}
+		*address += sgl_ctx->iov_offset;
+		*length -= sgl_ctx->iov_offset;
+	}
+
+	sgl_ctx->iov_offset += *length;
+	if (sgl_ctx->iov_offset == iov->iov_len) {
+		sgl_ctx->iovpos++;
+		sgl_ctx->iov_offset = 0;
+	}
+
+	/* Continue until all segments are consumed. */
+	return 0;
+}
+
+static void
+nvme_host_io_sgl_cb(void *cb_arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct nvme_host_sgl_ctx *sgl_ctx = cb_arg;
+	struct spdk_bdev_io *bdev_io = sgl_ctx->bdev_io;
+
+	/* SGL context lifetime ends when NVMe command completes. */
+	free(sgl_ctx);
+
+	spdk_bdev_io_complete(bdev_io,
+			      spdk_nvme_cpl_is_error(cpl)
+			      ? SPDK_BDEV_IO_STATUS_FAILED
+			      : SPDK_BDEV_IO_STATUS_SUCCESS);
+}
+
+static void
+nvme_host_read_get_buf_cb(struct spdk_io_channel *ch,
+			  struct spdk_bdev_io *bdev_io,
+			  bool success)
+{
+	if (!success) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		return;
+	}
+
+	nvme_host_bdev_submit_request(ch, bdev_io);
+}
+
+static void
 nvme_host_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
 	struct nvme_host_io_channel *host_ch = spdk_io_channel_get_ctx(ch);
 	struct nvme_host_bdev *bdev_ctx = host_ch->bdev_ctx;
+	struct nvme_host_sgl_ctx *sgl_ctx = NULL;
 	int rc = 0;
 
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
-		rc = spdk_nvme_ns_cmd_read(bdev_ctx->ns, host_ch->qpair,
-					   bdev_io->u.bdev.iovs[0].iov_base,
-					   bdev_io->u.bdev.offset_blocks,
-					   bdev_io->u.bdev.num_blocks,
-					   nvme_host_io_cb, bdev_io, 0);
+		/* Acquire a data buffer for requests that arrived without iovecs. */
+		if (bdev_io->u.bdev.iovcnt <= 0) {
+			spdk_bdev_io_get_buf(bdev_io, nvme_host_read_get_buf_cb,
+					     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
+			return;
+		}
+
+		if (bdev_io->u.bdev.iovcnt == 1) {
+			/* Fast path for contiguous payload. */
+			rc = spdk_nvme_ns_cmd_read(bdev_ctx->ns, host_ch->qpair,
+						   bdev_io->u.bdev.iovs[0].iov_base,
+						   bdev_io->u.bdev.offset_blocks,
+						   bdev_io->u.bdev.num_blocks,
+						   nvme_host_io_cb, bdev_io, 0);
+		} else {
+			/* Multi-iov path uses readv + SGL callbacks. */
+			sgl_ctx = calloc(1, sizeof(*sgl_ctx));
+			if (sgl_ctx == NULL) {
+				rc = -ENOMEM;
+				break;
+			}
+
+			/* Capture request scatter-gather array for callback iteration. */
+			sgl_ctx->bdev_io = bdev_io;
+			sgl_ctx->iovs = bdev_io->u.bdev.iovs;
+			sgl_ctx->iovcnt = bdev_io->u.bdev.iovcnt;
+
+			rc = spdk_nvme_ns_cmd_readv(bdev_ctx->ns, host_ch->qpair,
+						    bdev_io->u.bdev.offset_blocks,
+						    bdev_io->u.bdev.num_blocks,
+						    nvme_host_io_sgl_cb, sgl_ctx, 0,
+						    nvme_host_sgl_reset, nvme_host_sgl_next);
+		}
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
-		rc = spdk_nvme_ns_cmd_write(bdev_ctx->ns, host_ch->qpair,
-					    bdev_io->u.bdev.iovs[0].iov_base,
-					    bdev_io->u.bdev.offset_blocks,
-					    bdev_io->u.bdev.num_blocks,
-					    nvme_host_io_cb, bdev_io, 0);
+		/* Defensive guard: bdev request must contain at least one iovec. */
+		if (bdev_io->u.bdev.iovcnt <= 0) {
+			rc = -EINVAL;
+			break;
+		}
+
+		if (bdev_io->u.bdev.iovcnt == 1) {
+			/* Fast path for contiguous payload. */
+			rc = spdk_nvme_ns_cmd_write(bdev_ctx->ns, host_ch->qpair,
+						    bdev_io->u.bdev.iovs[0].iov_base,
+						    bdev_io->u.bdev.offset_blocks,
+						    bdev_io->u.bdev.num_blocks,
+						    nvme_host_io_cb, bdev_io, 0);
+		} else {
+			/* Multi-iov path uses writev + SGL callbacks. */
+			sgl_ctx = calloc(1, sizeof(*sgl_ctx));
+			if (sgl_ctx == NULL) {
+				rc = -ENOMEM;
+				break;
+			}
+
+			/* Capture request scatter-gather array for callback iteration. */
+			sgl_ctx->bdev_io = bdev_io;
+			sgl_ctx->iovs = bdev_io->u.bdev.iovs;
+			sgl_ctx->iovcnt = bdev_io->u.bdev.iovcnt;
+
+			rc = spdk_nvme_ns_cmd_writev(bdev_ctx->ns, host_ch->qpair,
+						     bdev_io->u.bdev.offset_blocks,
+						     bdev_io->u.bdev.num_blocks,
+						     nvme_host_io_sgl_cb, sgl_ctx, 0,
+						     nvme_host_sgl_reset, nvme_host_sgl_next);
+		}
 		break;
 	case SPDK_BDEV_IO_TYPE_FLUSH:
 		rc = spdk_nvme_ns_cmd_flush(bdev_ctx->ns, host_ch->qpair,
@@ -166,8 +317,22 @@ nvme_host_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *b
 		return;
 	}
 
+	if (rc == -ENOMEM) {
+		if (sgl_ctx != NULL) {
+			free(sgl_ctx);
+		}
+
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
+		return;
+	}
+
 	if (rc) {
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	}
+
+	if (rc && sgl_ctx != NULL) {
+		/* Submission failed before completion callback could own the context. */
+		free(sgl_ctx);
 	}
 }
 
@@ -660,62 +825,72 @@ host_fs_fini(void)
  * End of Host Filesystem Bdev Module
  * ============================================================ */
 
-struct dma_ctrl_ctx {
+struct fpga_bar_ctx {
+	void *vaddr;
+	uint64_t paddr;
+	uint64_t size;
+};
+
+struct fpga_prp_list_ctx {
+	void *vaddr;
+	uint64_t paddr;
+};
+
+struct dma_device_ctx {
 	struct nfb_device *dev;
 	struct nfb_comp *comp;
 	const char *pcie_bdf;
 };
 
-struct qop_cpl_ctx {
-	char cmd_name[20];
-	int qop_completed;
-	int32_t qid;
+struct admin_cmd_ctx {
+	const char *cmd_name;
+	bool done;
+	int status;
 };
 
-struct ncd_probe_ctx {
-	const char *select_dev;
-	uint16_t qsize;
-	struct spdk_nvme_transport_id *trid;
+struct fpga_hw_ctx {
+	struct spdk_pci_device *pci_dev;
 	uint32_t nsid;
-	struct spdk_pci_device *dev;
+	bool qid_allocated;
+	bool cq_created;
+	bool sq_created;
+	bool prp_lists_allocated;
 
-	void *sq_vaddr;
-	uint64_t sq_paddr;
-	uint64_t sq_byte_size;
-	void *cq_vaddr;
-	uint64_t cq_paddr;
-	uint64_t cq_byte_size;
-	void *wrbuff_vaddr;
-	uint64_t wrbuff_paddr;
-	uint64_t wrbuff_byte_size;
-	void *rdbuff_vaddr;
-	uint64_t rdbuff_paddr;
-	uint64_t rdbuff_byte_size;
+	struct fpga_bar_ctx sq;
+	struct fpga_bar_ctx cq;
+	struct fpga_bar_ctx wrbuff;
+	struct fpga_bar_ctx rdbuff;
 
-	void *wrbuff_prp_list_vaddr;
-	uint64_t wrbuff_prp_list_paddr;
-	void *rdbuff_prp_list_vaddr;
-	uint64_t rdbuff_prp_list_paddr;
+	struct fpga_prp_list_ctx wrbuff_prp_list;
+	struct fpga_prp_list_ctx rdbuff_prp_list;
 
 	uint64_t doorbell_base;
 	uint32_t doorbell_stride;
 
-	// The values that need to be written into the C/S registers before
-	// command gets to be dispatched.
-	uint16_t dbl_mask;
-	/* uint64_t sq_paddr; */
+	/* Values programmed into the FPGA command-dispatch registers. */
+	uint16_t doorbell_mask;
 	uint64_t sqtdbl_paddr;
 	uint64_t cqhdbl_paddr;
 	uint16_t lba_num_mask;
 	uint64_t lba_space_size;
 };
 
+struct app_ctx {
+	const char *select_dev;
+	uint16_t qsize;
+	struct spdk_nvme_transport_id *trid;
+	struct fpga_hw_ctx hw;
+};
+
 volatile int stop = 0;
+volatile sig_atomic_t g_dumpreq = 0;
 
 static void sig_usr(int signo)
 {
 	if (signo == SIGINT || signo == SIGTERM) {
 		stop = 1;
+	} else if (signo == SIGUSR1) {
+		g_dumpreq = 1;
 	}
 }
 
@@ -733,82 +908,185 @@ SPDK_PCI_DRIVER_REGISTER(ncd, ncd_pci_driver_id, SPDK_PCI_DRIVER_NEED_MAPPING)
 static void
 qop_complete_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
 {
-	struct qop_cpl_ctx *qctx = ctx;
+	struct admin_cmd_ctx *cmd_ctx = ctx;
 
-	qctx->qop_completed = 1;
+	cmd_ctx->done = true;
 	if (spdk_nvme_cpl_is_error(cpl)) {
-		spdk_nvme_print_completion(qctx->qid, (struct spdk_nvme_cpl *)cpl);
+		spdk_nvme_print_completion(0, (struct spdk_nvme_cpl *)cpl);
 		fprintf(stderr, "CPL error status: %s\n", spdk_nvme_cpl_get_status_string(&cpl->status));
-		fprintf(stderr, "%s failed, aborting run\n", qctx->cmd_name);
-		qctx->qop_completed = -1;
+		fprintf(stderr, "%s failed, aborting run\n", cmd_ctx->cmd_name);
+		cmd_ctx->status = -1;
 	}
 }
 
 static int
-submit_admin_request(struct spdk_nvme_cmd* cmd, char *cmd_name)
+submit_admin_request(struct spdk_nvme_cmd *cmd, const char *cmd_name)
 {
 	int rc = 0;
-	struct qop_cpl_ctx qctx = {0};
+	struct admin_cmd_ctx cmd_ctx = {
+		.cmd_name = cmd_name,
+	};
 
-	snprintf(qctx.cmd_name, sizeof(qctx.cmd_name), "%s", cmd_name);
-	qctx.qop_completed = 0;
-	qctx.qid = 0;
-	rc = spdk_nvme_ctrlr_cmd_admin_raw(g_namespace.ctrlr, cmd, NULL, 0, qop_complete_cb, &qctx);
+	rc = spdk_nvme_ctrlr_cmd_admin_raw(g_namespace.ctrlr, cmd, NULL, 0, qop_complete_cb, &cmd_ctx);
 	if (rc) {
-		printf("Failed to submit the command %s!\n", qctx.cmd_name);
+		printf("Failed to submit the command %s!\n", cmd_ctx.cmd_name);
 		return -1;
 	}
 
-	while (!qctx.qop_completed)
+	while (!cmd_ctx.done)
 		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
 
-	if (qctx.qop_completed == -1)
+	if (cmd_ctx.status != 0)
 		return -2;
 
 	return 0;
 }
 
-// static int
-// submit_rw_request(uint8_t rw, struct spdk_nvme_qpair* qpair, void* buf)
-// {
-// 	int rc = 0;
-// 	struct qop_cpl_ctx qctx = {0};
 
-// 	int (*rw_op)(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, void *payload,
-// 			   uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn,
-// 			   void *cb_arg, uint32_t io_flags) = NULL;
+/* P2P test: disable APST (needs 256B APST-table buffer) and force PS0 on the
+ * live controller (volatile; Samsung rejects the SAVE bit). Verify via GET. */
+static uint32_t g_feat_val;
+static bool     g_feat_done;
+static int      g_feat_status;
+static void
+feat_get_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
+{
+	g_feat_done = true;
+	if (spdk_nvme_cpl_is_error(cpl)) { g_feat_status = -1; return; }
+	g_feat_val = cpl->cdw0;
+}
+static uint32_t
+get_feature_val(uint8_t fid)
+{
+	void *buf = spdk_dma_zmalloc(4096, 0x1000, NULL);
+	g_feat_done = false; g_feat_status = 0; g_feat_val = 0xffffffff;
+	if (spdk_nvme_ctrlr_cmd_get_feature(g_namespace.ctrlr, fid, 0, buf, 4096,
+					    feat_get_cb, NULL)) {
+		if (buf) spdk_dma_free(buf);
+		return 0xffffffff;
+	}
+	while (!g_feat_done)
+		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
+	if (buf) spdk_dma_free(buf);
+	return g_feat_val;
+}
+static bool g_set_done;
+static int  g_set_status;
+static void
+feat_set_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
+{
+	g_set_done = true;
+	g_set_status = spdk_nvme_cpl_is_error(cpl) ? -1 : 0;
+}
+static int
+set_feature_buf(uint8_t fid, uint32_t cdw11, void *buf, uint32_t len)
+{
+	g_set_done = false; g_set_status = 0;
+	if (spdk_nvme_ctrlr_cmd_set_feature(g_namespace.ctrlr, fid, cdw11, 0,
+					    buf, len, feat_set_cb, NULL))
+		return -1;
+	while (!g_set_done)
+		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
+	return g_set_status;
+}
+static void
+force_active_power_state(void)
+{
+	void *apst_buf;
+	uint32_t a, pm;
 
-// 	// Read
-// 	if (rw == 1) {
-// 		rw_op = spdk_nvme_ns_cmd_read;
-// 	} else if (rw == 0) {
-// 		rw_op = spdk_nvme_ns_cmd_write;
-// 	}
+	printf("P2P: forcing APST off + PS0 on live controller...\n");
+	apst_buf = spdk_dma_zmalloc(256, 0x1000, NULL);
+	if (set_feature_buf(0x0c, 0x0, apst_buf, 256))
+		fprintf(stderr, "WARN: SET APST-disable failed\n");
+	if (set_feature_buf(0x02, 0x0, NULL, 0))
+		fprintf(stderr, "WARN: SET PS0 failed\n");
+	if (apst_buf)
+		spdk_dma_free(apst_buf);
 
-// 	snprintf(qctx.cmd_name, sizeof(qctx.cmd_name), "%s", (rw == 1) ? "RD" : "WR");
-// 	qctx.qop_completed = 0;
-// 	qctx.qid = spdk_nvme_qpair_get_id(qpair);
-// 	rc = rw_op(g_namespace.ns, qpair, buf, 0, 1, qop_complete_cb, &qctx, 0);
-// 	if (rc) {
-// 		fprintf(stderr, "Initial write of the control string to NVMe failed\n");
-// 		return -1;
-// 	}
+	a = get_feature_val(0x0c);
+	pm = get_feature_val(0x02);
+	printf("P2P VERIFY: APST(0x0c) cdw0=0x%08x (APSTE bit0=%u); PWRMGMT(0x02) cdw0=0x%08x (PS=%u)\n",
+	       a, a & 0x1, pm, pm & 0x1f);
+}
 
-// 	while (!qctx.qop_completed)
-// 		spdk_nvme_qpair_process_completions(qpair, 0);
 
-// 	if (qctx.qop_completed == -1)
-// 		return -2;
+/* P2P diagnostic: dump the drive's own NVMe log pages (Error Info 0x01,
+ * SMART 0x02) and CSTS, decoded. Called at baseline and on SIGUSR1. */
+static bool g_log_done;
+static int  g_log_status;
+static void
+log_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
+{
+	g_log_done = true;
+	g_log_status = spdk_nvme_cpl_is_error(cpl) ? -1 : 0;
+}
+static int
+get_log(uint8_t lid, void *buf, uint32_t sz)
+{
+	g_log_done = false; g_log_status = 0;
+	if (spdk_nvme_ctrlr_cmd_get_log_page(g_namespace.ctrlr, lid, 0xffffffff,
+					     buf, sz, 0, log_cb, NULL))
+		return -1;
+	while (!g_log_done)
+		spdk_nvme_ctrlr_process_admin_completions(g_namespace.ctrlr);
+	return g_log_status;
+}
+static void
+dump_nvme_logs(const char *tag)
+{
+	void *buf = spdk_dma_zmalloc(4096, 0x1000, NULL);
+	union spdk_nvme_csts_register csts;
+	int i, shown;
 
-// 	return 0;
-// }
+	printf("==== NVME LOGS [%s] ====\n", tag);
+	csts = spdk_nvme_ctrlr_get_regs_csts(g_namespace.ctrlr);
+	printf("[%s] CSTS: rdy=%u cfs=%u shst=%u\n", tag,
+	       csts.bits.rdy, csts.bits.cfs, csts.bits.shst);
+
+	if (buf && get_log(0x02, buf, 512) == 0) {
+		struct spdk_nvme_health_information_page *h = buf;
+		printf("[%s] SMART: critical_warning=0x%02x temperature=%uK media_errors=%lu num_err_log_entries=%lu ctrl_busy_time=%lu\n",
+		       tag, h->critical_warning.raw, h->temperature,
+		       (unsigned long)h->media_errors[0],
+		       (unsigned long)h->num_error_info_log_entries[0],
+		       (unsigned long)h->controller_busy_time[0]);
+	} else {
+		printf("[%s] SMART(0x02): READ FAILED\n", tag);
+	}
+
+	if (buf && get_log(0x01, buf, 64 * sizeof(struct spdk_nvme_error_information_entry)) == 0) {
+		struct spdk_nvme_error_information_entry *e = buf;
+		shown = 0;
+		printf("[%s] ERROR-INFO(0x01): entries with error_count>0:\n", tag);
+		for (i = 0; i < 64; i++) {
+			uint16_t st;
+			if (e[i].error_count == 0)
+				continue;
+			st = *(uint16_t *)&e[i].status;
+			printf("  [%s] ent%d: error_count=%lu sqid=%u cid=%u status=0x%04x(sct=%u sc=0x%02x) err_loc=0x%04x lba=%lu nsid=0x%x vs=0x%02x\n",
+			       tag, i, (unsigned long)e[i].error_count, e[i].sqid, e[i].cid,
+			       st, (st >> 9) & 0x7, (st >> 1) & 0xff,
+			       e[i].error_location, (unsigned long)e[i].lba, e[i].nsid,
+			       e[i].vendor_specific);
+			if (++shown >= 8) break;
+		}
+		if (shown == 0)
+			printf("  [%s] (no entries with error_count>0)\n", tag);
+	} else {
+		printf("[%s] ERROR-INFO(0x01): READ FAILED\n", tag);
+	}
+	if (buf) spdk_dma_free(buf);
+	fflush(stdout);
+}
 
 static int
-queues_alloc(struct ncd_probe_ctx *ncd_ctx)
+queues_alloc(struct app_ctx *app_ctx)
 {
 	int			       rc = 0;
 	struct spdk_nvme_io_qpair_opts qopts;
 	struct spdk_nvme_cmd           cmd = {0};
+	struct fpga_hw_ctx *hw = &app_ctx->hw;
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(g_namespace.ctrlr, &qopts, sizeof(struct spdk_nvme_io_qpair_opts));
 
@@ -816,26 +1094,26 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 	printf("IO queue size: %d\n", qopts.io_queue_size);
 	printf("IO queue requests: %d\n", qopts.io_queue_requests);
 
-	if (ncd_ctx->qsize == 0) {
+	if (app_ctx->qsize == 0) {
 		qopts.io_queue_requests = qopts.io_queue_size;
 	} else {
-		qopts.io_queue_requests = ncd_ctx->qsize;
-		qopts.io_queue_size = ncd_ctx->qsize;
+		qopts.io_queue_requests = app_ctx->qsize;
+		qopts.io_queue_size = app_ctx->qsize;
 	}
 
-	ncd_ctx->dbl_mask = qopts.io_queue_size -1;
+	hw->doorbell_mask = qopts.io_queue_size - 1;
 
-	qopts.sq.vaddr = ncd_ctx->sq_vaddr;
-	qopts.sq.paddr = ncd_ctx->sq_paddr;
-	qopts.sq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cmd);
+	qopts.sq.vaddr = hw->sq.vaddr;
+	qopts.sq.paddr = hw->sq.paddr;
+	qopts.sq.buffer_size = qopts.io_queue_size * sizeof(struct spdk_nvme_cmd);
 
-	qopts.cq.vaddr = ncd_ctx->cq_vaddr;
-	qopts.cq.paddr = ncd_ctx->cq_paddr;
-	qopts.cq.buffer_size = qopts.io_queue_size*sizeof(struct spdk_nvme_cpl);
+	qopts.cq.vaddr = hw->cq.vaddr;
+	qopts.cq.paddr = hw->cq.paddr;
+	qopts.cq.buffer_size = qopts.io_queue_size * sizeof(struct spdk_nvme_cpl);
 
 	// Reset the Completion Queue in the Hardware, otherwise previous completion entries get
 	// detected. This means return Phase Tags to value 0 (i.e. default value)
-	uint8_t *cpl_buff = ncd_ctx->cq_vaddr;
+	uint8_t *cpl_buff = hw->cq.vaddr;
 	for (uint32_t i = 14; i < qopts.cq.buffer_size; i+=sizeof(struct spdk_nvme_cpl)) {
 		cpl_buff[i] = 0;
 	}
@@ -847,112 +1125,125 @@ queues_alloc(struct ncd_probe_ctx *ncd_ctx)
 		goto qid_alloc_fail;
 
 	}
+	hw->qid_allocated = true;
 
-	ncd_ctx->sqtdbl_paddr = ncd_ctx->doorbell_base + (2*g_namespace.hw_qid) * (4 << ncd_ctx->doorbell_stride);
-	ncd_ctx->cqhdbl_paddr = ncd_ctx->doorbell_base + (2*g_namespace.hw_qid+1) * (4 << ncd_ctx->doorbell_stride);
+	hw->sqtdbl_paddr = hw->doorbell_base + (2 * g_namespace.hw_qid) * (4 << hw->doorbell_stride);
+	hw->cqhdbl_paddr = hw->doorbell_base + (2 * g_namespace.hw_qid + 1) * (4 << hw->doorbell_stride);
 
 	printf("Allocate qid %d\n", g_namespace.hw_qid);
 
 	cmd.opc = SPDK_NVME_OPC_CREATE_IO_CQ;
 	cmd.nsid = 0;
 	cmd.cdw10_bits.create_io_q.qid = g_namespace.hw_qid;
-	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size-1;
+	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
 	cmd.cdw11_bits.create_io_cq.pc = 1;
-	cmd.dptr.prp.prp1 = ncd_ctx->cq_paddr;
+	cmd.dptr.prp.prp1 = hw->cq.paddr;
 
 	rc = submit_admin_request(&cmd, "CQ_CREATE");
 	if (rc) {
 		printf("Failed to submit the Admin command!\n");
 		goto cq_create_fail;
 	}
+	hw->cq_created = true;
 
 	printf("HW CQ allocated!\n");
 
 	cmd.opc = SPDK_NVME_OPC_CREATE_IO_SQ;
 	cmd.nsid = 0;
 	cmd.cdw10_bits.create_io_q.qid = g_namespace.hw_qid;
-	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size-1;
+	cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
 	cmd.cdw11_bits.create_io_sq.pc = 1;
 	cmd.cdw11_bits.create_io_sq.qprio = 2;
 	cmd.cdw11_bits.create_io_sq.cqid = g_namespace.hw_qid;
-	cmd.dptr.prp.prp1 = ncd_ctx->sq_paddr;
+	cmd.dptr.prp.prp1 = hw->sq.paddr;
 
 	rc = submit_admin_request(&cmd, "SQ_CREATE");
 	if (rc) {
 		printf("Failed to submit the Admin command!\n");
 		goto sq_create_fail;
 	}
+	hw->sq_created = true;
 
 	printf("HW SQ allocated!\n");
 
 	return 0;
 
-	cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
-	cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-	rc = submit_admin_request(&cmd, "SQ_DELETE");
-	if (rc) {
-		printf("Failed to submit Admin command!\n");
-	}
-
 sq_create_fail:
-	cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
-	cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-	rc = submit_admin_request(&cmd, "CQ_DELETE");
-	if (rc) {
-		printf("Failed to submit the Admin command!\n");
+	if (hw->cq_created) {
+		cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
+		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
+		rc = submit_admin_request(&cmd, "CQ_DELETE");
+		if (rc) {
+			printf("Failed to submit the Admin command!\n");
+		}
+		hw->cq_created = false;
 	}
 
 cq_create_fail:
-	spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+	if (hw->qid_allocated) {
+		spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+		hw->qid_allocated = false;
+		g_namespace.hw_qid = -1;
+	}
 qid_alloc_fail:
 	return rc;
 }
 
-static void queues_delete(struct ncd_probe_ctx *ncd_ctx)
+static void queues_delete(struct fpga_hw_ctx *hw)
 {
 	int rc = 0;
 	struct spdk_nvme_cmd cmd = {0};
 
-	cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
-	cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-	rc = submit_admin_request(&cmd, "SQ_DELETE");
-	if (rc) {
-		printf("Failed to submit Admin command!\n");
+	if (hw->sq_created) {
+		cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
+		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
+		rc = submit_admin_request(&cmd, "SQ_DELETE");
+		if (rc) {
+			printf("Failed to submit Admin command!\n");
+		}
+		hw->sq_created = false;
 	}
 
-	cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
-	cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
-	rc = submit_admin_request(&cmd, "CQ_DELETE");
-	if (rc) {
-		printf("Failed to submit the Admin command!\n");
+	if (hw->cq_created) {
+		cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
+		cmd.cdw10_bits.delete_io_q.qid = g_namespace.hw_qid;
+		rc = submit_admin_request(&cmd, "CQ_DELETE");
+		if (rc) {
+			printf("Failed to submit the Admin command!\n");
+		}
+		hw->cq_created = false;
 	}
 }
 
 static void
-queues_dealloc(struct ncd_probe_ctx *ncd_ctx)
+queues_dealloc(struct fpga_hw_ctx *hw)
 {
-	queues_delete(ncd_ctx);
-	spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+	queues_delete(hw);
+	if (hw->qid_allocated) {
+		spdk_nvme_ctrlr_free_qid(g_namespace.ctrlr, g_namespace.hw_qid);
+		hw->qid_allocated = false;
+		g_namespace.hw_qid = -1;
+	}
 }
 
 static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
 {
-	struct ncd_probe_ctx *probe_ctx = cb_ctx;
+	struct app_ctx *app_ctx = cb_ctx;
 
 	printf("Probing %s ...\n", trid->traddr);
 
-	if (probe_ctx->qsize != 0) {
-		opts->io_queue_size = probe_ctx->qsize;
-		opts->io_queue_requests = probe_ctx->qsize;
+	if (app_ctx->qsize != 0) {
+		opts->io_queue_size = app_ctx->qsize;
+		opts->io_queue_requests = app_ctx->qsize;
 	} else {
 		opts->io_queue_requests = opts->io_queue_size;
 	}
 	opts->arb_mechanism = SPDK_NVME_CC_AMS_RR;
 	opts->enable_interrupts = false;
 
-	if (!strcmp(trid->traddr, probe_ctx->trid->traddr))
+	if (!strcmp(trid->traddr, app_ctx->trid->traddr))
 		return true;
 
 	return false;
@@ -984,7 +1275,8 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	uint64_t bar_start, bar_end, bar_flags;
 	FILE *fp;
 	union spdk_nvme_cap_register cap;
-	struct ncd_probe_ctx *probe_ctx = cb_ctx;
+	struct app_ctx *app_ctx = cb_ctx;
+	struct fpga_hw_ctx *hw = &app_ctx->hw;
 	uint32_t sect_size;
 
 	printf("Attaching to %s ...\n", trid->traddr);
@@ -1022,9 +1314,9 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	// Unlimited Max Data transfer size
 	if (cdata->mdts == 0) {
-		probe_ctx->lba_num_mask = 0xFFFF;
+		hw->lba_num_mask = 0xFFFF;
 	} else {
-		probe_ctx->lba_num_mask = (uint16_t)((1 << (12 + cap.bits.mpsmin + cdata->mdts)) / sect_size) - 1;
+		hw->lba_num_mask = (uint16_t)((1 << (12 + cap.bits.mpsmin + cdata->mdts)) / sect_size) - 1;
 	}
 
 	printf("Controller options:\n");
@@ -1035,8 +1327,8 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("\tNS %d size:             %juGB\n", nsid, spdk_nvme_ns_get_size(ns) / 1000000000);
 	printf("\tNS number of sectors:  %ld\n", spdk_nvme_ns_get_num_sectors(ns));
 	printf("\tNS sector size:        %dB\n", sect_size);
-	printf("\tLBA Mask:              x%x (%d)\n", probe_ctx->lba_num_mask, probe_ctx->lba_num_mask);
-	probe_ctx->lba_space_size = spdk_nvme_ns_get_num_sectors(ns);
+	printf("\tLBA Mask:              x%x (%d)\n", hw->lba_num_mask, hw->lba_num_mask);
+	hw->lba_space_size = spdk_nvme_ns_get_num_sectors(ns);
 
 	rd_ctrl_regs(ctrlr);
 
@@ -1070,13 +1362,13 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("Physical address of NVME BAR0: 0x%lx\n", bar_start);
 
 	// Doorbell registers start at offset 0x1000 from BAR0 but they start from the Admin Queues!
-	probe_ctx->doorbell_base = bar_start + 0x1000;
-	probe_ctx->doorbell_stride = cap.bits.dstrd;
-	printf("Doorbell stride: %d\n", probe_ctx->doorbell_stride);
-	probe_ctx->nsid = nsid;
+	hw->doorbell_base = bar_start + 0x1000;
+	hw->doorbell_stride = cap.bits.dstrd;
+	printf("Doorbell stride: %d\n", hw->doorbell_stride);
+	hw->nsid = nsid;
 }
 
-static int dma_dev_init(const char* select_dev, struct dma_ctrl_ctx *dma_ctx)
+static int dma_dev_init(const char *select_dev, struct dma_device_ctx *dma_ctx)
 {
 	int rc = 0;
 	const void *fdt;
@@ -1104,71 +1396,104 @@ static int dma_dev_init(const char* select_dev, struct dma_ctrl_ctx *dma_ctx)
 
 fdt_get_fail:
 	nfb_close(dma_ctx->dev);
+	dma_ctx->dev = NULL;
 dev_open_fail:
 	return rc;
 }
 
-static int prp_list_alloc(struct ncd_probe_ctx *ncd_ctx)
+static int prp_list_alloc(struct fpga_hw_ctx *hw)
 {
 	uint64_t size = VALUE_4KB;
-	ncd_ctx->wrbuff_prp_list_vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
-	if (ncd_ctx->wrbuff_prp_list_vaddr == NULL) {
+	hw->wrbuff_prp_list.vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
+	if (hw->wrbuff_prp_list.vaddr == NULL) {
 		fprintf(stderr, "ERROR: Write PRP list allocation failed\n");
 		return -1;
 	}
 
-	ncd_ctx->rdbuff_prp_list_vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
-	if (ncd_ctx->rdbuff_prp_list_vaddr == NULL) {
+	hw->rdbuff_prp_list.vaddr = spdk_dma_zmalloc(VALUE_4KB, VALUE_4KB, NULL);
+	if (hw->rdbuff_prp_list.vaddr == NULL) {
 		fprintf(stderr, "ERROR: Read PRP list allocation failed\n");
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
 		return -2;
 	}
 
-	ncd_ctx->wrbuff_prp_list_paddr = spdk_vtophys(ncd_ctx->wrbuff_prp_list_vaddr, &size);
-	if (ncd_ctx->wrbuff_prp_list_paddr == SPDK_VTOPHYS_ERROR) {
+	hw->wrbuff_prp_list.paddr = spdk_vtophys(hw->wrbuff_prp_list.vaddr, &size);
+	if (hw->wrbuff_prp_list.paddr == SPDK_VTOPHYS_ERROR) {
 		fprintf(stderr, "ERROR: Failed to get physical address of the Write PRP list buffer\n");
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
 		return -3;
 	}
 
 	if (size != VALUE_4KB) {
 		fprintf(stderr, "ERROR: Write PRP list buffer size is not 4096 bytes (detected size: %lu)\n", size);
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
 		return -4;
 	}
 
-	ncd_ctx->rdbuff_prp_list_paddr = spdk_vtophys(ncd_ctx->rdbuff_prp_list_vaddr, &size);
-	if (ncd_ctx->rdbuff_prp_list_paddr == SPDK_VTOPHYS_ERROR) {
+	hw->rdbuff_prp_list.paddr = spdk_vtophys(hw->rdbuff_prp_list.vaddr, &size);
+	if (hw->rdbuff_prp_list.paddr == SPDK_VTOPHYS_ERROR) {
 		fprintf(stderr, "ERROR: Failed to get physical address of the Read PRP list buffer\n");
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
 		return -5;
 	}
 
 	if (size != VALUE_4KB) {
 		fprintf(stderr, "ERROR: Read PRP list buffer size is not 4096 bytes (detected size: %lu)\n", size);
-		spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-		spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+		spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+		spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+		hw->wrbuff_prp_list.vaddr = NULL;
+		hw->rdbuff_prp_list.vaddr = NULL;
 		return -6;
 	}
 
-	for (int i = 1; i < (int)(ncd_ctx->wrbuff_byte_size / VALUE_4KB); i++) {
-		((uint64_t *)ncd_ctx->wrbuff_prp_list_vaddr)[i-1] = ncd_ctx->wrbuff_paddr + (i * VALUE_4KB);
-		((uint64_t *)ncd_ctx->rdbuff_prp_list_vaddr)[i-1] = ncd_ctx->rdbuff_paddr + (i * VALUE_4KB);
+	for (int i = 1; i < (int)(hw->wrbuff.size / VALUE_4KB); i++) {
+		((uint64_t *)hw->wrbuff_prp_list.vaddr)[i - 1] = hw->wrbuff.paddr + (i * VALUE_4KB);
+		((uint64_t *)hw->rdbuff_prp_list.vaddr)[i - 1] = hw->rdbuff.paddr + (i * VALUE_4KB);
 	}
+	hw->prp_lists_allocated = true;
 
 	return 0;
 }
 
-static void prp_list_free(struct ncd_probe_ctx *ncd_ctx)
+static void prp_list_free(struct fpga_hw_ctx *hw)
 {
-	spdk_dma_free(ncd_ctx->wrbuff_prp_list_vaddr);
-	spdk_dma_free(ncd_ctx->rdbuff_prp_list_vaddr);
+	if (!hw->prp_lists_allocated) {
+		return;
+	}
+
+	spdk_dma_free(hw->wrbuff_prp_list.vaddr);
+	spdk_dma_free(hw->rdbuff_prp_list.vaddr);
+	hw->wrbuff_prp_list.vaddr = NULL;
+	hw->rdbuff_prp_list.vaddr = NULL;
+	hw->wrbuff_prp_list.paddr = 0;
+	hw->rdbuff_prp_list.paddr = 0;
+	hw->prp_lists_allocated = false;
 }
 
-static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
+static void prp_list_print(const struct fpga_hw_ctx *hw)
+{
+	printf("Write PRP List (vaddr: %p, paddr: 0x%lx):\n", hw->wrbuff_prp_list.vaddr, hw->wrbuff_prp_list.paddr);
+	for (int i = 0; i < (int)(hw->wrbuff.size / VALUE_4KB) - 1; i++) {
+		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)hw->wrbuff_prp_list.vaddr)[i]);
+	}
+
+	printf("Read PRP List (vaddr: %p, paddr: 0x%lx):\n", hw->rdbuff_prp_list.vaddr, hw->rdbuff_prp_list.paddr);
+	for (int i = 0; i < (int)(hw->rdbuff.size / VALUE_4KB) - 1; i++) {
+		printf("\tEntry %d: 0x%lx\n", i, ((uint64_t *)hw->rdbuff_prp_list.vaddr)[i]);
+	}
+}
+
+static int dma_ctrl_init(struct fpga_hw_ctx *hw, struct dma_device_ctx *dma_ctx)
 {
 	int rc = 0;
 	int node;
@@ -1181,34 +1506,38 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 		goto dma_open_fail;
 	}
 
-	rc = prp_list_alloc(ncd_ctx);
+	rc = prp_list_alloc(hw);
 	if (rc) {
 		fprintf(stderr, "ERROR: PRP list allocation failed\n");
 		goto prp_alloc_fail;
 	}
 
-	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, ncd_ctx->dbl_mask);
-	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BADDR, ncd_ctx->sqtdbl_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BADDR, ncd_ctx->cqhdbl_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_BADDR, ncd_ctx->rdbuff_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_PRP_LIST_PTR, ncd_ctx->rdbuff_prp_list_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_BADDR, ncd_ctx->wrbuff_paddr);
-	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_PRP_LIST_PTR, ncd_ctx->wrbuff_prp_list_paddr);
-	nfb_comp_write16(dma_ctx->comp, REG_LBA_NUM_MASK, ncd_ctx->lba_num_mask);
-	nfb_comp_write64(dma_ctx->comp, REG_LBA_SPACE_SIZE, ncd_ctx->lba_space_size);
+	nfb_comp_write16(dma_ctx->comp, REG_DBL_MASK, hw->doorbell_mask);
+	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BADDR, hw->sqtdbl_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BADDR, hw->cqhdbl_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_BADDR, hw->rdbuff.paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_RDBUFF_PRP_LIST_PTR, hw->rdbuff_prp_list.paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_BADDR, hw->wrbuff.paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_WRBUFF_PRP_LIST_PTR, hw->wrbuff_prp_list.paddr);
+	nfb_comp_write16(dma_ctx->comp, REG_LBA_NUM_MASK, hw->lba_num_mask);
+	nfb_comp_write64(dma_ctx->comp, REG_LBA_SPACE_SIZE, hw->lba_space_size);
 	nfb_comp_write64(dma_ctx->comp, REG_META_PTR, 0);
 	return 0;
 
 prp_alloc_fail:
 	nfb_comp_close(dma_ctx->comp);
+	dma_ctx->comp = NULL;
 dma_open_fail:
 	return rc;
 }
 
-static void dma_ctrl_deinit(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
+static void dma_ctrl_deinit(struct fpga_hw_ctx *hw, struct dma_device_ctx *dma_ctx)
 {
-	prp_list_free(ncd_ctx);
-	nfb_comp_close(dma_ctx->comp);
+	prp_list_free(hw);
+	if (dma_ctx->comp != NULL) {
+		nfb_comp_close(dma_ctx->comp);
+		dma_ctx->comp = NULL;
+	}
 }
 
 static void
@@ -1216,9 +1545,8 @@ usage(const char *program_name)
 {
 	printf("%s [options]", program_name);
 	printf("\t\n");
-	printf("options:\n");
-	printf("\t[-c dispatches commands continuously otherwise specify the amount with -p flag]\n");
-	printf("\t[-d selected nfb device (default 0)]\n");
+	printf("\t[-h show this help]\n");
+	printf("SPDK options:\n");
 	printf("\t[-m DPDK huge memory size in MB]\n");
 	printf("\t[-g use single file descriptor for DPDK memory segments]\n");
 	printf("\t[-i shared memory group ID]\n");
@@ -1227,6 +1555,8 @@ usage(const char *program_name)
 #else
 	printf("\t[-L enable debug logging (flag disabled, must reconfigure with --enable-debug)]\n");
 #endif
+	printf("DMA Iuventus options:\n");
+	printf("\t[-d selected nfb device (default 0)]\n");
 	printf("\t[-t <fmt> Transport ID for local PCIe NVMe]\n");
 	printf("\t\t Format: 'key:value [key:value] ...'\n");
 	printf("\t\t Keys:\n");
@@ -1239,9 +1569,9 @@ usage(const char *program_name)
 	printf("\t\t  hostnqn     Host NQN\n");
 	printf("\t\t Example: -t 'trtype:PCIe traddr:0000:04:00.0' for PCIe\n");
 	printf("\t\t Note: Currently, only PCIe transfer are supported for one device only\n");
-	printf("\t[-s <num> the amount of LBAs to copy within a single command]\n");
-	printf("\t[-q <num> size of the queues in items (Commands for SQ or Completions for CQ)]\n");
-	printf("\t[-p <num> the amount of commands to dispatch]\n");
+	printf("\t[-s do a subsystem reset (i.e. hard reset, the PCIe device can disappear from the system)]\n");
+	printf("\t[-r do a controller reset (i.e. soft reset)]\n");
+	printf("\t[-q <num> size of the NVMe queues in items]\n");
 	printf("\t     Note: the NVMe namespace is exposed as /dev/ublkb%u via ublk.\n", NVME_HOST_UBLK_ID);
 	printf("\t           Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK=y.\n");
 }
@@ -1250,7 +1580,7 @@ bool do_ctrl_rst = false;
 bool do_subs_rst = false;
 
 static int
-parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_probe_ctx *ctx)
+parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct app_ctx *ctx)
 {
 	int op, rc;
 
@@ -1259,13 +1589,6 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 		case 'd':
 			ctx->select_dev = optarg;
 			break;
-		// case 'p':
-		// 	ctx->cmds_to_disp = spdk_strtol(optarg, 10);
-		// 	if (ctx->cmds_to_disp < 1) {
-		// 		fprintf(stderr, "Invalid amount of commands to dispatch (must be greater than 0)\n");
-		// 		exit(EXIT_FAILURE);
-		// 	}
-		// 	break;
 		case 'q':
 			ctx->qsize = spdk_strtol(optarg, 10);
 			if (ctx->qsize < 4) {
@@ -1273,9 +1596,6 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 				exit(EXIT_FAILURE);
 			}
 			break;
-		// case 'c':
-		// 	ctx->contiguous_dispatch = true;
-		// 	break;
 		case 's':
 			do_subs_rst = true;
 			break;
@@ -1333,9 +1653,10 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 {
 	int rc;
 	uint16_t cmd_reg;
-	struct ncd_probe_ctx *probe_ctx = ctx;
+	struct app_ctx *app_ctx = ctx;
+	struct fpga_hw_ctx *hw = &app_ctx->hw;
 
-	probe_ctx->dev = pci_dev;
+	hw->pci_dev = pci_dev;
 
 	/* Enable Memory accesses, PCI busmaster and disable INTx */
 	spdk_pci_device_cfg_read16(pci_dev, &cmd_reg, 4);
@@ -1345,61 +1666,42 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	// 1. SKIP Enable device (Apparently, it is enabled by the dpdk-devbind)
 	// 2. map BARs for Submission Queue, Completion Queueu, and the Data Transmission
 
-	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR, &probe_ctx->sq_vaddr, &probe_ctx->sq_paddr, &probe_ctx->sq_byte_size);
+	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR, &hw->sq.vaddr, &hw->sq.paddr, &hw->sq.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR %d (SQ)\n", SQ_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR, &probe_ctx->cq_vaddr, &probe_ctx->cq_paddr, &probe_ctx->cq_byte_size);
+	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR, &hw->cq.vaddr, &hw->cq.paddr, &hw->cq.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR %d (CQ)\n", CQ_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &probe_ctx->wrbuff_vaddr, &probe_ctx->wrbuff_paddr, &probe_ctx->wrbuff_byte_size);
+	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &hw->wrbuff.vaddr, &hw->wrbuff.paddr, &hw->wrbuff.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR %d (WR buffer)\n", WRBUFF_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &probe_ctx->rdbuff_vaddr, &probe_ctx->rdbuff_paddr, &probe_ctx->rdbuff_byte_size);
+	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &hw->rdbuff.vaddr, &hw->rdbuff.paddr, &hw->rdbuff.size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR %d (RD buffer)\n", RDBUFF_BAR);
 		return rc;
 	}
 
-	if (probe_ctx->cq_vaddr == NULL || probe_ctx->sq_vaddr == NULL || probe_ctx->rdbuff_vaddr == NULL || probe_ctx->wrbuff_vaddr == NULL) {
+	if (hw->cq.vaddr == NULL || hw->sq.vaddr == NULL || hw->rdbuff.vaddr == NULL || hw->wrbuff.vaddr == NULL) {
 		fprintf(stderr, "Virtual BAR adresses invalid!\n");
 		return -1;
 	}
-	if (probe_ctx->cq_paddr == 0 || probe_ctx->sq_paddr == 0 || probe_ctx->rdbuff_paddr == 0 || probe_ctx->wrbuff_paddr == 0) {
+	if (hw->cq.paddr == 0 || hw->sq.paddr == 0 || hw->rdbuff.paddr == 0 || hw->wrbuff.paddr == 0) {
 		fprintf(stderr, "Physical BAR adresses invalid!\n");
 		return -2;
 	}
-	if (probe_ctx->cq_byte_size <= 0 || probe_ctx->sq_byte_size <= 0 || probe_ctx->rdbuff_byte_size <= 0 || probe_ctx->wrbuff_byte_size <= 0) {
+	if (hw->cq.size == 0 || hw->sq.size == 0 || hw->rdbuff.size == 0 || hw->wrbuff.size == 0) {
 		fprintf(stderr, "BAR sizes invalid!\n");
 		return -3;
 	}
-
-	/* printf("CQ BAR VADDR: %p\n", probe_ctx->cq_vaddr); */
-	/* printf("CQ BAR PADDR: %lx\n", probe_ctx->cq_paddr); */
-	/* printf("CQ BAR size:  %ld\n", probe_ctx->cq_byte_size); */
-	/* printf("DATA BAR VADDR: %p\n", probe_ctx->wrbuff_vaddr); */
-	/* printf("DATA BAR PADDR: %lx\n", probe_ctx->wrbuff_paddr); */
-	/* printf("DATA BAR size:  %ld\n", probe_ctx->wrbuff_byte_size); */
-
-	/* rc = spdk_pci_device_disable_interrupts(pci_dev); */
-	/* if (rc) { */
-	/* 	fprintf(stderr, "Unable to disable interrupts\n"); */
-	/* 	return rc; */
-	/* } */
-
-	/* rc = spdk_pci_device_disable_interrupt(pci_dev); */
-	/* if (rc) { */
-	/* 	fprintf(stderr, "Unable to disable interrupt\n"); */
-	/* 	return rc; */
-	/* } */
 
 	return 0;
  }
@@ -1412,18 +1714,20 @@ main(int argc, char **argv)
 	struct spdk_pci_driver *ncd_driver;
 	struct spdk_nvme_transport_id trid = {0};
 	struct spdk_pci_addr pcie_addr;
-	struct ncd_probe_ctx ctx = {0};
-	struct dma_ctrl_ctx dma_ctx = {0};
+	struct app_ctx app_ctx = {0};
+	struct dma_device_ctx dma_ctx = {0};
+	struct fpga_hw_ctx *hw = &app_ctx.hw;
 
 	// Assign default attributes
 	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
-	ctx.trid = &trid;
-	ctx.qsize = 0;
-	ctx.select_dev = "0";
+	app_ctx.trid = &trid;
+	app_ctx.qsize = 0;
+	app_ctx.select_dev = "0";
+	g_namespace.hw_qid = -1;
 
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
-	rc = parse_args(argc, argv, &opts, &ctx);
+	rc = parse_args(argc, argv, &opts, &app_ctx);
 	if (rc != 0) {
 		return rc;
 	}
@@ -1435,7 +1739,7 @@ main(int argc, char **argv)
 	}
 
 	printf("Initializing NVMe Controller for device %s\n", trid.traddr);
-	rc = spdk_nvme_probe(NULL, &ctx, probe_cb, attach_cb, NULL);
+	rc = spdk_nvme_probe(NULL, &app_ctx, probe_cb, attach_cb, NULL);
 	if (rc != 0) {
 		fprintf(stderr, "ERROR: spdk_nvme_probe() failed\n");
 		goto nvme_probe_fail;
@@ -1471,7 +1775,7 @@ main(int argc, char **argv)
 		goto ctrlr_reset_fail;
 	}
 
-	rc = dma_dev_init(ctx.select_dev, &dma_ctx);
+	rc = dma_dev_init(app_ctx.select_dev, &dma_ctx);
 	if (rc) {
 		fprintf(stderr, "Error initializing DMA NFB Device\n");
 		goto dma_dev_init_fail;
@@ -1485,7 +1789,7 @@ main(int argc, char **argv)
 
 	pcie_addr.func += 1;
 
-	rc = spdk_pci_device_attach(ncd_driver, ncd_drv_attach_cb, &ctx, &pcie_addr);
+	rc = spdk_pci_device_attach(ncd_driver, ncd_drv_attach_cb, &app_ctx, &pcie_addr);
 	if (rc) {
 		fprintf(stderr, "Unable to attach PCIE device!\n");
 		goto dma_dev_init_fail;
@@ -1493,57 +1797,38 @@ main(int argc, char **argv)
 
 	printf("PCIE domain initialization complete\n");
 	printf("NCD PCIe device context:\n");
-	printf("\tSQ VADDR: %p\n", ctx.sq_vaddr);
-	printf("\tSQ PADDR: %lx\n", ctx.sq_paddr);
-	printf("\tSQ size:  %ld bytes\n", ctx.sq_byte_size);
-	printf("\tCQ VADDR: %p\n", ctx.cq_vaddr);
-	printf("\tCQ PADDR: %lx\n", ctx.cq_paddr);
-	printf("\tCQ size:  %ld bytes\n", ctx.cq_byte_size);
-	printf("\tWRBUFF VADDR: %p\n", ctx.wrbuff_vaddr);
-	printf("\tWRBUFF PADDR: %lx\n", ctx.wrbuff_paddr);
-	printf("\tWRBUFF size:  %ld bytes\n", ctx.wrbuff_byte_size);
-	printf("\tRDBUFF VADDR: %p\n", ctx.rdbuff_vaddr);
-	printf("\tRDBUFF PADDR: %lx\n", ctx.rdbuff_paddr);
-	printf("\tRDBUFF size:  %ld bytes\n", ctx.rdbuff_byte_size);
+	printf("\tSQ VADDR: %p\n", hw->sq.vaddr);
+	printf("\tSQ PADDR: %lx\n", hw->sq.paddr);
+	printf("\tSQ size:  %ld bytes\n", hw->sq.size);
+	printf("\tCQ VADDR: %p\n", hw->cq.vaddr);
+	printf("\tCQ PADDR: %lx\n", hw->cq.paddr);
+	printf("\tCQ size:  %ld bytes\n", hw->cq.size);
+	printf("\tWRBUFF VADDR: %p\n", hw->wrbuff.vaddr);
+	printf("\tWRBUFF PADDR: %lx\n", hw->wrbuff.paddr);
+	printf("\tWRBUFF size:  %ld bytes\n", hw->wrbuff.size);
+	printf("\tRDBUFF VADDR: %p\n", hw->rdbuff.vaddr);
+	printf("\tRDBUFF PADDR: %lx\n", hw->rdbuff.paddr);
+	printf("\tRDBUFF size:  %ld bytes\n", hw->rdbuff.size);
 
-	rc = queues_alloc(&ctx);
+	rc = queues_alloc(&app_ctx);
 	if (rc) {
 		fprintf(stderr, "Unable to allocate queues!\n");
 		goto queue_alloc_fail;
 	}
-	printf("\tSQTDBL physical address: 0x%lx\n", ctx.sqtdbl_paddr);
-	printf("\tCQHDBL physical address: 0x%lx\n", ctx.cqhdbl_paddr);
+	printf("\tSQTDBL physical address: 0x%lx\n", hw->sqtdbl_paddr);
+	printf("\tCQHDBL physical address: 0x%lx\n", hw->cqhdbl_paddr);
 	printf("Queues allocated.\n");
 
-	/* buf = spdk_dma_zmalloc(0x1000, 0x1000, NULL); */
-	/* if (buf == NULL) { */
-	/* 	fprintf(stderr, "ERROR: write buffer allocation failed\n"); */
-	/* 	goto buf_alloc_fail; */
-	/* } */
+	force_active_power_state();
+	dump_nvme_logs("BASELINE");
 
-	/* snprintf(buf, 0x1000, "%s", DATA_BUFFER_STRING); */
-
-	// Write test string to the NVMe
-	/* rc = submit_rw_request(0, g_namespace.sw_qpair, buf); */
-	/* if (rc) { */
-	/* 	fprintf(stderr, "ERROR: Failed to submit RW request!\n"); */
-	/* 	goto buf_alloc_fail; */
-	/* } */
-
-	/* Read test string from NVMe and write it to the FPGA */
-	/* for (int it = 0; it < 1000; it++) { */
-	/* rc = submit_rw_request(1, g_namespace.sw_qpair, ctx.data_bar_vaddr); */
-	/* if (rc) { */
-	/* 	fprintf(stderr, "ERROR: Failed to submit RW request!\n"); */
-	/* 	goto buf_alloc_fail; */
-	/* } */
-	/* } */
-
-	rc = dma_ctrl_init(&ctx, &dma_ctx);
+	rc = dma_ctrl_init(hw, &dma_ctx);
 	if (rc) {
 		fprintf(stderr, "Error configuring the DMA Iuventus controller structure\n");
 		goto dma_ctrl_alloc_fail;
 	}
+
+	prp_list_print(hw);
 
 	/*
 	 * Initialise the host-side filesystem path.  This registers a thin
@@ -1558,7 +1843,8 @@ main(int argc, char **argv)
 	 * managed entirely by the FPGA DMA logic – no additional
 	 * synchronisation between the two paths is required here.
 	 */
-	rc = host_fs_init(g_namespace.ns);
+	rc = 0; /* ublk/host-fs DISABLED for P2P counter test */
+	/* rc = host_fs_init(g_namespace.ns); */
 	if (rc) {
 		fprintf(stderr, "Warning: host filesystem (ublk) initialisation failed (%d).\n"
 			"The FPGA path will continue to operate normally.\n", rc);
@@ -1566,17 +1852,16 @@ main(int argc, char **argv)
 		rc = 0;
 	}
 
-	// Can be commented out if we want to keep statistics between runs
 	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_RPT_UPD_EN | CTRL_ENABLE);
 	usleep(1);
 
 	signal(SIGINT, sig_usr);
 	signal(SIGTERM, sig_usr);
+	signal(SIGUSR1, sig_usr);
 
 	printf("Initialization complete. Starting main loop.\n");
 
 	usleep(1000);
-	//spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
 
 	/*
 	 * Main loop: poll every tracked SPDK thread so that ublk requests
@@ -1592,6 +1877,10 @@ main(int argc, char **argv)
 		for (i = 0; i < g_num_threads; i++) {
 			spdk_thread_poll(g_all_threads[i], 0, 0);
 		}
+		if (g_dumpreq) {
+			g_dumpreq = 0;
+			dump_nvme_logs("POST-WEDGE");
+		}
 		usleep(1000);
 	}
 	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, 0);
@@ -1604,22 +1893,29 @@ main(int argc, char **argv)
 	/* Tear down the host filesystem before any lower-level cleanup. */
 	host_fs_fini();
 
-	dma_ctrl_deinit(&ctx, &dma_ctx);
+	dma_ctrl_deinit(hw, &dma_ctx);
 
 	rd_ctrl_regs(g_namespace.ctrlr);
 
-/* buf_alloc_fail: */
 dma_ctrl_alloc_fail:
-	queues_dealloc(&ctx);
+	queues_dealloc(hw);
 	printf("Qeues dealloced\n");
 queue_alloc_fail:
-	spdk_pci_device_detach(ctx.dev);
+	if (hw->pci_dev != NULL) {
+		spdk_pci_device_detach(hw->pci_dev);
+		hw->pci_dev = NULL;
+	}
 	printf("Pcie dev detached\n");
-	/* fflush(stdout); */
 dma_dev_init_fail:
-	nfb_close(dma_ctx.dev);
+	if (dma_ctx.dev != NULL) {
+		nfb_close(dma_ctx.dev);
+		dma_ctx.dev = NULL;
+	}
 ctrlr_reset_fail:
-	spdk_nvme_detach(g_controller.ctrlr);
+	if (g_controller.ctrlr != NULL) {
+		spdk_nvme_detach(g_controller.ctrlr);
+		g_controller.ctrlr = NULL;
+	}
 	printf("NVME Controller detached\n");
 nvme_probe_fail:
 	spdk_env_fini();
