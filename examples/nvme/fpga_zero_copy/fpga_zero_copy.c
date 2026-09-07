@@ -8,8 +8,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/queue.h>
-
+#include <libfdt.h>
 #include <signal.h>
+
 #include <nfb/nfb.h>
 
 #include "spdk/stdinc.h"
@@ -58,6 +59,8 @@
 #define CTRL_CLR_ERR_MASK (1 << 4)
 #define CTRL_CNTRS_RST    (1 << 5)
 #define CTRL_SEQV_RW      (1 << 6)
+#define CTRL_RPT_UPD_EN   (1 << 7)
+#define CTRL_CQE_PROC_EN  (1 << 8)
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr	*ctrlr;
@@ -75,6 +78,7 @@ struct ns_entry {
 struct dma_ctrl_ctx {
 	struct nfb_device *dev;
 	struct nfb_comp *comp;
+	const char *pcie_bdf;
 };
 
 struct qop_cpl_ctx {
@@ -84,6 +88,7 @@ struct qop_cpl_ctx {
 };
 
 struct ncd_probe_ctx {
+	const char *select_dev;
 	uint32_t cmds_to_disp;
 	uint16_t qsize;
 	bool contiguous_dispatch;
@@ -355,6 +360,15 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 
 	printf("Probing %s ...\n", trid->traddr);
 
+	if (probe_ctx->qsize != 0) {
+		opts->io_queue_size = probe_ctx->qsize;
+		opts->io_queue_requests = probe_ctx->qsize;
+	} else {
+		opts->io_queue_requests = opts->io_queue_size;
+	}
+	opts->arb_mechanism = SPDK_NVME_CC_AMS_RR;
+	opts->enable_interrupts = false;
+
 	if (!strcmp(trid->traddr, probe_ctx->trid->traddr))
 		return true;
 
@@ -368,7 +382,6 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	int nsid;
 	struct spdk_nvme_ns *ns;
 	const struct spdk_nvme_ctrlr_data *cdata;
-	const struct spdk_nvme_ctrlr_opts *copts;
 	struct spdk_pci_device *pci_dev;
 	struct spdk_pci_addr pci_addr;
 	char bdf[32];
@@ -420,19 +433,14 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	}
 
 	printf("Controller options:\n");
-	copts = spdk_nvme_ctrlr_get_opts(ctrlr);
-	if (copts == NULL) {
-		fprintf(stderr, "No controller options found!");
-		return;
-	}
 
-	printf("\tNumber of IO queues:   %d\n", copts->num_io_queues);
-	printf("\tSize of IO queues:     %d\n", copts->io_queue_size);
-	printf("\tIO queue requests:     %d\n", copts->io_queue_requests);
+	printf("\tNumber of IO queues:   %d\n", opts->num_io_queues);
+	printf("\tSize of IO queues:     %d\n", opts->io_queue_size);
+	printf("\tIO queue requests:     %d\n", opts->io_queue_requests);
 	printf("\tNS %d size:             %juGB\n", nsid, spdk_nvme_ns_get_size(ns) / 1000000000);
 	printf("\tNS number of sectors:  %ld\n", spdk_nvme_ns_get_num_sectors(ns));
 	printf("\tNS sector size:        %dB\n", sect_size);
-	printf("\tLBA Mask:              %x\n", probe_ctx->lba_mask);
+	printf("\tLBA Mask:              x%x (%d)\n", probe_ctx->lba_mask, probe_ctx->lba_mask);
 
 	pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
 	if (!pci_dev) {
@@ -470,6 +478,38 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	probe_ctx->nsid = nsid;
 }
 
+static int dma_dev_init(const char* select_dev, struct dma_ctrl_ctx *dma_ctx)
+{
+	int rc = 0;
+	const void *fdt;
+	int fdt_offset;
+	int len;
+
+	dma_ctx->dev = nfb_open(select_dev);
+	if(!dma_ctx->dev) {
+		fprintf(stderr, "ERROR: Failed to open NFB device");
+		rc = -1;
+		goto dev_open_fail;
+	}
+
+	fdt = nfb_get_fdt(dma_ctx->dev);
+	fdt_offset = fdt_path_offset(fdt, "/system/device/endpoint0");
+	dma_ctx->pcie_bdf = fdt_getprop(fdt, fdt_offset, "pci-slot", &len);
+	if (len < 0) {
+		fprintf(stderr, "ERROR: Failed to get pci-slot from device's Device Tree!\n");
+		rc = -2;
+		goto fdt_get_fail;
+
+	}
+
+	return 0;
+
+fdt_get_fail:
+	nfb_close(dma_ctx->dev);
+dev_open_fail:
+	return rc;
+}
+
 static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma_ctx)
 {
 	int rc = 0;
@@ -477,25 +517,18 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	struct nfb_comp *dlogger;
 	uint16_t chosen_lba_num;
 
-	dma_ctx->dev = nfb_open("/dev/nfb/by-pci-slot/0000:61:00.0");
-	if(!dma_ctx->dev) {
-		fprintf(stderr, "ERROR: Failed to open NFB device");
-		rc = -1;
-		goto dev_open_fail;
-	}
-
 	node = nfb_comp_find(dma_ctx->dev, "ziti,dma_iuventus", 0);
 	dma_ctx->comp = nfb_comp_open(dma_ctx->dev, node);
 	if (dma_ctx->comp == NULL) {
-		fprintf(stderr, "ERROR: Failed to open DMA control registers as nfb_comp");
+		fprintf(stderr, "ERROR: Failed to open DMA control registers as nfb_comp!\n");
 		rc = -2;
 		goto dma_open_fail;
 	}
 
-	node = nfb_comp_find(dma_ctx->dev, "ziti,dma_iops_meter", 0);
+	node = nfb_comp_find(dma_ctx->dev, "netcope,dma_iops_meter", 0);
 	dlogger = nfb_comp_open(dma_ctx->dev, node);
 	if (dlogger == NULL) {
-		fprintf(stderr, "ERROR: Failed to open Data Logger as nfb_comp");
+		fprintf(stderr, "ERROR: Failed to open Data Logger as nfb_comp!\n");
 		rc = -3;
 		goto dlogger_open_fail;
 	}
@@ -512,6 +545,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 	nfb_comp_write64(dma_ctx->comp, REG_SQTDBL_BASE_ADDR, ncd_ctx->sqtdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_CQHDBL_BASE_ADDR, ncd_ctx->cqhdbl_paddr);
 	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_1_ADDR, ncd_ctx->data_bar_paddr);
+	nfb_comp_write64(dma_ctx->comp, REG_PRP_ENTRY_2_ADDR, ncd_ctx->data_bar_paddr + VALUE_4KB);
 	if (ncd_ctx->lba_num > ncd_ctx->lba_mask)
 		chosen_lba_num = ncd_ctx->lba_mask;
 	else
@@ -526,15 +560,7 @@ static int dma_ctrl_init(struct ncd_probe_ctx *ncd_ctx, struct dma_ctrl_ctx *dma
 dlogger_open_fail:
 	nfb_comp_close(dma_ctx->comp);
 dma_open_fail:
-	nfb_close(dma_ctx->dev);
-dev_open_fail:
 	return rc;
-}
-
-static void dma_ctrl_close(struct dma_ctrl_ctx *dma_ctx)
-{
-	nfb_comp_close(dma_ctx->comp);
-	nfb_close(dma_ctx->dev);
 }
 
 static void
@@ -544,7 +570,8 @@ usage(const char *program_name)
 	printf("\t\n");
 	printf("options:\n");
 	printf("\t[-c dispatches commands continuously otherwise specify the amount with -p flag]\n");
-	printf("\t[-d DPDK huge memory size in MB]\n");
+	printf("\t[-d selected nfb device (default 0)]\n");
+	printf("\t[-m DPDK huge memory size in MB]\n");
 	printf("\t[-g use single file descriptor for DPDK memory segments]\n");
 	printf("\t[-i shared memory group ID]\n");
 #ifdef DEBUG
@@ -576,8 +603,11 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 {
 	int op, rc;
 
-	while ((op = getopt(argc, argv, "s:i:gd:L:hrt:cq:p:")) != -1) {
+	while ((op = getopt(argc, argv, "s:i:gm:L:hrt:cq:p:d:")) != -1) {
 		switch (op) {
+		case 'd':
+			ctx->select_dev = optarg;
+			break;
 		case 'p':
 			ctx->cmds_to_disp = spdk_strtol(optarg, 10);
 			if (ctx->cmds_to_disp < 1) {
@@ -612,7 +642,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts, struct ncd_pro
 		case 'g':
 			env_opts->hugepage_single_segments = true;
 			break;
-		case 'd':
+		case 'm':
 			env_opts->mem_size = spdk_strtol(optarg, 10);
 			if (env_opts->mem_size < 0) {
 				fprintf(stderr, "Invalid DPDK memory size\n");
@@ -657,7 +687,7 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	int rc;
 	uint16_t cmd_reg;
 	struct ncd_probe_ctx *probe_ctx = ctx;
-	uint64_t mem_register_start;
+	/* uint64_t mem_register_start; */
 		/* mem_register_end; */
 
 	probe_ctx->dev = pci_dev;
@@ -676,13 +706,13 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, 1, &probe_ctx->cq_bar_vaddr, &probe_ctx->cq_bar_paddr, &probe_ctx->cq_bar_size);
+	rc = spdk_pci_device_map_bar(pci_dev, 2, &probe_ctx->cq_bar_vaddr, &probe_ctx->cq_bar_paddr, &probe_ctx->cq_bar_size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR 1\n");
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, 2, &probe_ctx->data_bar_vaddr, &probe_ctx->data_bar_paddr, &probe_ctx->data_bar_size);
+	rc = spdk_pci_device_map_bar(pci_dev, 4, &probe_ctx->data_bar_vaddr, &probe_ctx->data_bar_paddr, &probe_ctx->data_bar_size);
 	if (rc) {
 		fprintf(stderr, "Unable to map BAR 2\n");
 		return rc;
@@ -729,7 +759,7 @@ static int ncd_drv_attach_cb(void *ctx, struct spdk_pci_device *pci_dev)
 	/* } */
 
 	return 0;
-}
+ }
 
 int
 main(int argc, char **argv)
@@ -751,6 +781,7 @@ main(int argc, char **argv)
 	ctx.contiguous_dispatch = false;
 	ctx.qsize = 0;
 	ctx.cmds_to_disp = 0;
+	ctx.select_dev = "0";
 
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
@@ -804,16 +835,24 @@ main(int argc, char **argv)
 		goto ctrlr_reset_fail;
 	}
 
-	rc = spdk_pci_addr_parse(&pcie_addr, "0000:61:00.1");
+	rc = dma_dev_init(ctx.select_dev, &dma_ctx);
+	if (rc) {
+		fprintf(stderr, "Error initializing DMA NFB Device\n");
+		goto dma_dev_init_fail;
+	}
+
+	rc = spdk_pci_addr_parse(&pcie_addr, dma_ctx.pcie_bdf);
 	if (rc) {
 		fprintf(stderr, "Unable to parse PCIE address!\n");
-		goto ctrlr_reset_fail;
+		goto dma_dev_init_fail;
 	}
+
+	pcie_addr.func += 1;
 
 	rc = spdk_pci_device_attach(ncd_driver, ncd_drv_attach_cb, &ctx, &pcie_addr);
 	if (rc) {
 		fprintf(stderr, "Unable to attach PCIE device!\n");
-		goto ctrlr_reset_fail;
+		goto dma_dev_init_fail;
 	}
 
 	printf("PCIE domain initialization complete\n");
@@ -864,20 +903,20 @@ main(int argc, char **argv)
 
 	rc = dma_ctrl_init(&ctx, &dma_ctx);
 	if (rc) {
-		fprintf(stderr, "Error opening the DMA Iuventus controller structure\n");
+		fprintf(stderr, "Error configuring the DMA Iuventus controller structure\n");
 		goto dma_ctrl_alloc_fail;
 	}
 
 	// Can be commented out if we want to keep statistics between runs
 	nfb_comp_write64(dma_ctx.comp, REG_LBA_SPACE_SIZE, 0x000000000FFFFFFF);
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_CNTRS_RST | CTRL_RD_EN);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_CNTRS_RST | CTRL_RD_EN);
 	nfb_comp_write32(dma_ctx.comp, REG_CMDS_TO_DISP_CNTR_LOAD, ctx.cmds_to_disp);
 	usleep(1);
 
-	uint8_t regval = CTRL_SEQV_RW | CTRL_RD_EN | CTRL_LOAD_CNTR;
+	uint32_t regval = CTRL_CQE_PROC_EN | CTRL_SEQV_RW | CTRL_RD_EN | CTRL_LOAD_CNTR | CTRL_RPT_UPD_EN;
 	if (ctx.contiguous_dispatch)
 		regval |= CTRL_CONTIG_DISP;
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, regval);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, regval);
 	printf("NCD run to generate commands (READ of %u LBAs), contiguous_dispatch: %d\n", ctx.lba_num, ctx.contiguous_dispatch);
 
 	signal(SIGINT, sig_usr);
@@ -886,16 +925,17 @@ main(int argc, char **argv)
 	usleep(1000);
 	spdk_nvme_print_command(g_namespace.hw_qid, ctx.sq_bar_vaddr);
 
-	while (!stop && ctx.contiguous_dispatch) usleep(1000);
+	while (!stop && ctx.contiguous_dispatch) usleep(10000);
 
-	nfb_comp_write8(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_CQE_PROC_EN | CTRL_SEQV_RW | CTRL_RD_EN | CTRL_RPT_UPD_EN);
 	printf("Stopping NCD generator\n");
 
 	while (nfb_comp_read16(dma_ctx.comp, REG_SQTDBL) != nfb_comp_read16(dma_ctx.comp, REG_SQHDBL))
-		usleep(1000);
+		usleep(1000000);
 
-	dma_ctrl_close(&dma_ctx);
+	nfb_comp_write16(dma_ctx.comp, REG_CONTROL, CTRL_SEQV_RW | CTRL_RD_EN);
 
+	nfb_comp_close(dma_ctx.comp);
 /* buf_alloc_fail: */
 dma_ctrl_alloc_fail:
 	queues_dealloc(&ctx);
@@ -906,6 +946,8 @@ queue_alloc_fail:
 	spdk_pci_device_detach(ctx.dev);
 	printf("Pcie dev detached\n");
 	/* fflush(stdout); */
+dma_dev_init_fail:
+	nfb_close(dma_ctx.dev);
 ctrlr_reset_fail:
 	spdk_nvme_detach(g_controller.ctrlr);
 	printf("NVME Controller detached\n");
