@@ -47,6 +47,17 @@ extern "C" {
  * also the largest number of card queues the library will configure.
  */
 #define IUVENTUS_MAX_PEERS 8
+/* Queues the design instantiates (DMA_IUVENTUS NUM_QUEUES). The RTL binds queue q to endpoint
+ * q / (IUVENTUS_HW_QUEUES / endpoints) -- queues 0..1 on endpoint 0, 2..3 on endpoint 1 -- and
+ * the host must mirror that split exactly, whatever the peer count. */
+#define IUVENTUS_HW_QUEUES 4
+
+/**
+ * Largest number of PCIe endpoints one card exposes. Single-endpoint firmware attaches only
+ * ep[0]; bifurcated firmware attaches ep[0] and ep[1], and splits the card queues evenly across
+ * them -- see iuventus_queue_ep().
+ */
+#define IUVENTUS_MAX_EPS 2
 
 /** Bound recommended for iuventus_drain(), in milliseconds. */
 #define IUVENTUS_DRAIN_TIMEOUT_MS 5000
@@ -112,6 +123,31 @@ struct iuventus_prp_list {
 };
 
 /**
+ * One PCIe endpoint of the card: its own pair of NVMe queue BARs, its own pair of data-pool
+ * BARs, and its own PRP lists for those pools. A card queue always uses the BARs of the endpoint
+ * iuventus_queue_ep() names for it, never another endpoint's.
+ */
+struct iuventus_ep {
+	/** BAR holding the NVMe submission rings, one 4 KiB page per card queue on this endpoint. */
+	struct iuventus_bar		sq;
+	/** BAR holding the NVMe completion rings, one 4 KiB page per card queue on this endpoint. */
+	struct iuventus_bar		cq;
+	/** Data pool the card writes to a drive from, on this endpoint. */
+	struct iuventus_bar		wrbuff;
+	/** Data pool the card reads from a drive into, on this endpoint. */
+	struct iuventus_bar		rdbuff;
+
+	/** PRP list published for wrbuff. */
+	struct iuventus_prp_list	wrbuff_prp_list;
+	/** PRP list published for rdbuff. */
+	struct iuventus_prp_list	rdbuff_prp_list;
+
+	/* Library bookkeeping. */
+	struct spdk_pci_device		*pci_dev;
+	bool				prp_lists_allocated;
+};
+
+/**
  * Options for iuventus_init().
  *
  * Always fill this in with iuventus_opts_init() before touching any field: opts_size is what
@@ -160,28 +196,17 @@ struct iuventus_ctx {
 	/** Number of valid entries in peers[]. */
 	uint32_t			num_peers;
 
-	/** BAR holding the NVMe submission rings, one 4 KiB page per card queue. */
-	struct iuventus_bar		sq;
-	/** BAR holding the NVMe completion rings, one 4 KiB page per card queue. */
-	struct iuventus_bar		cq;
-	/** Data pool the card writes to a drive from. */
-	struct iuventus_bar		wrbuff;
-	/** Data pool the card reads from a drive into. */
-	struct iuventus_bar		rdbuff;
-
-	/** PRP list published for the write data pool. */
-	struct iuventus_prp_list	wrbuff_prp_list;
-	/** PRP list published for the read data pool. */
-	struct iuventus_prp_list	rdbuff_prp_list;
+	/** PCIe endpoints the card exposes. Card queue q uses ep[iuventus_queue_ep(ctx, q)]. */
+	struct iuventus_ep		ep[IUVENTUS_MAX_EPS];
+	/** Number of valid entries in ep[]: 1 on single-endpoint firmware, 2 on bifurcated firmware. */
+	uint32_t			num_eps;
 
 	/* Library bookkeeping. */
-	struct spdk_pci_device		*pci_dev;
 	struct nfb_device		*nfb_dev;
 	struct nfb_comp			*nfb_comp;
 	const char			*pcie_bdf;
 	uint16_t			qsize;
 	bool				rpt_upd_en;
-	bool				prp_lists_allocated;
 	bool				enabled;
 };
 
@@ -322,6 +347,19 @@ uint32_t iuventus_num_peers(const struct iuventus_ctx *ctx);
  * \return the peer, or NULL if i is out of range.
  */
 const struct iuventus_peer *iuventus_peer(const struct iuventus_ctx *ctx, uint32_t i);
+
+/**
+ * Endpoint whose BARs a card queue's SQ/CQ and data pool live on.
+ *
+ * The design splits its IUVENTUS_HW_QUEUES queues into contiguous halves: queue q is on endpoint
+ * q / (IUVENTUS_HW_QUEUES / ctx->num_eps), independent of how many peers are attached. On
+ * single-endpoint firmware (ctx->num_eps == 1) this is always 0.
+ *
+ * \param ctx Environment handle.
+ * \param q Card queue index, below iuventus_num_peers().
+ * \return endpoint index, below ctx->num_eps.
+ */
+uint32_t iuventus_queue_ep(const struct iuventus_ctx *ctx, uint32_t q);
 
 #ifdef __cplusplus
 }
