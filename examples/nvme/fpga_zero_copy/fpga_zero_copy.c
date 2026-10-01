@@ -35,7 +35,8 @@
  * This module wraps host-side NVMe software queue pairs as
  * an SPDK bdev so that the host can access the NVMe namespace
  * through the standard SPDK block-device layer and, from there,
- * through ublk as a regular Linux block device (/dev/ublkb0).
+ * through ublk as a regular Linux block device (/dev/ublkb<q> for
+ * every drive q selected with -U).
  *
  * The FPGA uses its own queue pair (hw_qid, managed via raw
  * admin commands) while each host I/O channel owns its own
@@ -43,6 +44,13 @@
  * so no cross-device locking is required.
  * ============================================================
  */
+
+/* Bdev name prefix; drive q's bdev is fpga_nvme_host<q> and its kernel disk /dev/ublkb<q>. */
+#define NVME_HOST_BDEV_PREFIX "fpga_nvme_host"
+/* Host I/O queue pair per drive: deeper than one ublk queue (128) so a full ublk queue fits. */
+#define NVME_HOST_QPAIR_SIZE  256
+/* Upper bound on any one host-fs control step; a step that misses it is reported, not waited on. */
+#define HOST_FS_STEP_TIMEOUT_MS 15000
 
 /* Opaque per-bdev context. */
 struct nvme_host_bdev {
@@ -340,8 +348,16 @@ nvme_host_create_ch(void *io_device, void *ctx_buf)
 	struct nvme_host_bdev *bdev_ctx = io_device;
 	struct nvme_host_io_channel *ch = ctx_buf;
 
+	struct spdk_nvme_ctrlr *ctrlr = spdk_nvme_ns_get_ctrlr(bdev_ctx->ns);
+	struct spdk_nvme_io_qpair_opts qopts;
+
+	/* Explicit size: the controller default is the card's -q depth, shallower than a ublk queue. */
+	spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &qopts, sizeof(qopts));
+	qopts.io_queue_size     = NVME_HOST_QPAIR_SIZE;
+	qopts.io_queue_requests = NVME_HOST_QPAIR_SIZE;
+
 	ch->bdev_ctx = bdev_ctx;
-	ch->qpair = spdk_nvme_ctrlr_alloc_io_qpair(spdk_nvme_ns_get_ctrlr(bdev_ctx->ns), NULL, 0);
+	ch->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &qopts, sizeof(qopts));
 	if (ch->qpair == NULL) {
 		return -ENOMEM;
 	}
@@ -375,16 +391,12 @@ static const struct spdk_bdev_fn_table g_nvme_host_fn_table = {
 	.get_io_channel    = nvme_host_bdev_get_io_channel,
 };
 
-/* Name used to identify the bdev within the SPDK bdev layer. */
-#define NVME_HOST_BDEV_NAME "fpga_nvme_host"
-/*
- * ublk device ID.  The kernel block device will appear as
- * /dev/ublkb<NVME_HOST_UBLK_ID>.
- */
-#define NVME_HOST_UBLK_ID   0
-
-static struct nvme_host_bdev *g_nvme_host_bdev = NULL;
+static struct nvme_host_bdev *g_nvme_host_bdev[IUVENTUS_MAX_PEERS];
+static bool                   g_ublk_started[IUVENTUS_MAX_PEERS];
 static struct spdk_thread    *g_host_thread = NULL;
+/* How far host_fs_lib_init() got, so host_fs_fini() undoes exactly that much. */
+enum host_fs_stage { HOST_FS_NONE, HOST_FS_ACCEL, HOST_FS_IOBUF, HOST_FS_BDEV, HOST_FS_UBLK };
+static enum host_fs_stage     g_host_fs_stage = HOST_FS_NONE;
 
 /*
  * Thread registry: ublk_create_target() spawns one SPDK thread per
@@ -424,12 +436,53 @@ host_thread_exit_msg(void *cb_arg)
 	spdk_thread_exit(spdk_get_thread());
 }
 
+/* Poll every tracked SPDK thread once; returns non-zero when any of them did work. */
+static int
+host_fs_poll_all(void)
+{
+	int busy = 0;
+	int i;
+
+	for (i = 0; i < g_num_threads; i++) {
+		if (g_all_threads[i] != NULL && spdk_thread_poll(g_all_threads[i], 0, 0) > 0) {
+			busy = 1;
+		}
+	}
+	return busy;
+}
+
+static uint64_t
+host_fs_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Polls every tracked thread until *done is set or the step deadline passes (-ETIMEDOUT). */
+static int
+host_fs_wait(volatile bool *done, const char *what)
+{
+	uint64_t deadline = host_fs_now_ms() + HOST_FS_STEP_TIMEOUT_MS;
+
+	while (!*done) {
+		host_fs_poll_all();
+		if (host_fs_now_ms() > deadline) {
+			fprintf(stderr, "ERROR: host fs: '%s' did not finish within %d ms\n",
+				what, HOST_FS_STEP_TIMEOUT_MS);
+			return -ETIMEDOUT;
+		}
+	}
+	return 0;
+}
+
 /*
  * Register a thin bdev backed by the host SW queue pair so that the
  * NVMe namespace can be exposed as a standard Linux block device.
  */
 static int
-nvme_host_bdev_create(struct spdk_nvme_ns *ns)
+nvme_host_bdev_create(uint32_t q, const char *name, struct spdk_nvme_ns *ns)
 {
 	struct nvme_host_bdev *bdev_ctx;
 	int rc;
@@ -442,7 +495,7 @@ nvme_host_bdev_create(struct spdk_nvme_ns *ns)
 	bdev_ctx->ns = ns;
 
 	bdev_ctx->bdev.ctxt         = bdev_ctx;
-	bdev_ctx->bdev.name         = strdup(NVME_HOST_BDEV_NAME);
+	bdev_ctx->bdev.name         = strdup(name);
 	bdev_ctx->bdev.product_name = "FPGA NVMe Host Bdev";
 	bdev_ctx->bdev.fn_table     = &g_nvme_host_fn_table;
 	bdev_ctx->bdev.module       = &g_nvme_host_module;
@@ -453,7 +506,7 @@ nvme_host_bdev_create(struct spdk_nvme_ns *ns)
 	spdk_io_device_register(bdev_ctx,
 				nvme_host_create_ch, nvme_host_destroy_ch,
 				sizeof(struct nvme_host_io_channel),
-				"nvme_host");
+				name);
 
 	rc = spdk_bdev_register(&bdev_ctx->bdev);
 	if (rc) {
@@ -463,14 +516,15 @@ nvme_host_bdev_create(struct spdk_nvme_ns *ns)
 		return rc;
 	}
 
-	g_nvme_host_bdev = bdev_ctx;
+	g_nvme_host_bdev[q] = bdev_ctx;
 	return 0;
 }
 
 /* Callbacks used while initialising / finalising the bdev subsystem. */
 struct host_fs_sync_ctx {
-	int  rc;
-	bool done;
+	int           rc;
+	volatile bool done;
+	uint32_t      id;
 };
 
 static void
@@ -500,14 +554,12 @@ ublk_start_cb(void *cb_arg, int result)
 	ctx->done = true;
 
 	if (result) {
-		fprintf(stderr, "ERROR: Failed to start ublk disk (id=%u): %d\n",
-			NVME_HOST_UBLK_ID, result);
+		fprintf(stderr, "ERROR: Failed to start ublk disk (id=%u): %d\n", ctx->id, result);
 	} else {
-		printf("Host filesystem bdev registered as: /dev/ublkb%u\n",
-		       NVME_HOST_UBLK_ID);
-		printf("  To format: mkfs.ext4 /dev/ublkb%u\n", NVME_HOST_UBLK_ID);
-		printf("  To mount:  mount /dev/ublkb%u /mnt/nvme\n", NVME_HOST_UBLK_ID);
+		printf("Host filesystem bdev %s%u registered as: /dev/ublkb%u\n",
+		       NVME_HOST_BDEV_PREFIX, ctx->id, ctx->id);
 	}
+	fflush(stdout);
 }
 
 /* Called once ublk_stop_disk() completes. */
@@ -520,43 +572,36 @@ ublk_stop_cb(void *cb_arg, int result)
 	ctx->done = true;
 }
 
+static void host_fs_fini(void);
+
 /*
- * Initialise the host-filesystem path:
- *  1. Start the SPDK thread library (with a thread-tracking hook so that
- *     the extra threads spawned by ublk_create_target are polled by the
- *     main loop).
- *  2. Initialise the iobuf pool and bdev subsystem.
- *  3. Register the custom NVMe bdev backed by the SW queue pair.
- *  4. Expose the bdev via ublk as /dev/ublkb<NVME_HOST_UBLK_ID>.
- *     Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK=y.
+ * Start the host-filesystem libraries once, before any drive is added:
+ *  1. The SPDK thread library (with a thread-tracking hook so that the
+ *     extra threads spawned by ublk_create_target are polled by the main loop).
+ *  2. accel, iobuf and the bdev subsystem.
+ *  3. The ublk target. Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK.
  *
- * Returns 0 on success, negative errno on failure.
+ * Returns 0 on success, negative errno on failure (everything started is undone).
  */
 static int
-host_fs_init(struct spdk_nvme_ns *ns)
+host_fs_lib_init(void)
 {
 	struct host_fs_sync_ctx ctx = {0};
 	int rc;
 
-	/*
-	 * Initialise the SPDK thread library with the tracking callback so
-	 * that any additional SPDK threads created later (e.g. by
-	 * ublk_create_target) are collected in g_all_threads[].
-	 */
 	rc = spdk_thread_lib_init(host_thread_op_fn, 0);
 	if (rc) {
-		fprintf(stderr, "ERROR: spdk_thread_lib_init_ext() failed: %d\n", rc);
+		fprintf(stderr, "ERROR: spdk_thread_lib_init() failed: %d\n", rc);
 		return rc;
 	}
 
-	/* Create the primary host-filesystem SPDK thread. */
+	/* Create the primary host-filesystem SPDK thread (the app thread ublk control runs on). */
 	g_host_thread = spdk_thread_create("host_fs", NULL);
 	if (!g_host_thread) {
 		fprintf(stderr, "ERROR: Failed to create host_fs SPDK thread\n");
-		rc = -ENOMEM;
-		goto thread_create_fail;
+		spdk_thread_lib_fini();
+		return -ENOMEM;
 	}
-	/* g_host_thread was tracked via host_thread_op_fn above. */
 	spdk_set_thread(g_host_thread);
 
 	/*
@@ -567,185 +612,151 @@ host_fs_init(struct spdk_nvme_ns *ns)
 	rc = spdk_accel_initialize();
 	if (rc) {
 		fprintf(stderr, "ERROR: spdk_accel_initialize() failed: %d\n", rc);
-		goto accel_init_fail;
+		goto fail;
 	}
+	g_host_fs_stage = HOST_FS_ACCEL;
 
-	/*
-	 * Initialise the iobuf memory pool.  Both the bdev I/O-channel layer
-	 * and the ublk driver require this before any I/O channels can be
-	 * created.
-	 */
+	/* Both the bdev I/O-channel layer and the ublk driver need the iobuf pool. */
 	rc = spdk_iobuf_initialize();
 	if (rc) {
 		fprintf(stderr, "ERROR: spdk_iobuf_initialize() failed: %d\n", rc);
-		goto iobuf_init_fail;
+		goto fail;
 	}
+	g_host_fs_stage = HOST_FS_IOBUF;
 
 	/* Initialise the bdev subsystem; our custom module_init() is a no-op. */
-	ctx = (struct host_fs_sync_ctx){0};
 	spdk_bdev_initialize(bdev_init_done_cb, &ctx);
-	while (!ctx.done) {
-		spdk_thread_poll(g_host_thread, 0, 0);
-	}
-	if (ctx.rc) {
+	rc = host_fs_wait(&ctx.done, "bdev initialize");
+	if (rc == 0 && ctx.rc) {
 		fprintf(stderr, "ERROR: spdk_bdev_initialize() failed: %d\n", ctx.rc);
 		rc = ctx.rc;
-		goto bdev_init_fail;
 	}
-
-	/* Register the custom bdev that wraps per-channel host SW queue pairs. */
-	rc = nvme_host_bdev_create(ns);
 	if (rc) {
-		fprintf(stderr, "ERROR: nvme_host_bdev_create() failed: %d\n", rc);
-		goto bdev_create_fail;
+		goto fail;
 	}
+	g_host_fs_stage = HOST_FS_BDEV;
 
 	/*
-	 * ublk path: exposes the NVMe namespace as /dev/ublkb<id>.
-	 *
-	 * ublk uses io_uring for the kernel↔user communication path.
-	 * ublk_create_target() spawns one additional SPDK thread per
-	 * active CPU core; those threads are captured by
-	 * host_thread_op_fn() above and polled in the main loop.
-	 *
-	 * Restrict ublk to a single CPU (core 0) to avoid creating
-	 * too many poll-group threads in this non-reactor environment.
+	 * ublk uses io_uring for the kernel<->user path and spawns one poll-group
+	 * thread per CPU in the mask; those are captured by host_thread_op_fn()
+	 * and polled by the main loop. One CPU (core 0) keeps the thread count
+	 * small in this non-reactor environment.
 	 */
 	spdk_ublk_init();
-
 	rc = ublk_create_target("0x1", NULL);
 	if (rc) {
 		fprintf(stderr, "ERROR: ublk_create_target() failed: %d\n", rc);
-		goto frontend_fail;
+		goto fail;
 	}
-
-	ctx = (struct host_fs_sync_ctx){0};
-	rc = ublk_start_disk(NVME_HOST_BDEV_NAME, NVME_HOST_UBLK_ID,
-			     UBLK_DEV_NUM_QUEUE, UBLK_DEV_QUEUE_DEPTH,
-			     ublk_start_cb, &ctx);
-	if (rc) {
-		fprintf(stderr, "ERROR: ublk_start_disk() failed: %d\n", rc);
-		goto frontend_fail;
-	}
-	while (!ctx.done) {
-		int i;
-		for (i = 0; i < g_num_threads; i++) {
-			spdk_thread_poll(g_all_threads[i], 0, 0);
-		}
-	}
-	if (ctx.rc) {
-		fprintf(stderr, "ERROR: ublk disk start failed: %d\n", ctx.rc);
-		rc = ctx.rc;
-		goto frontend_fail;
-	}
+	g_host_fs_stage = HOST_FS_UBLK;
 
 	return 0;
 
-frontend_fail:
-	{
-		struct host_fs_sync_ctx fini_ctx = {0};
-		int i;
-		ublk_destroy_target(bdev_fini_done_cb, &fini_ctx);
-		while (!fini_ctx.done) {
-			for (i = 0; i < g_num_threads; i++) {
-				spdk_thread_poll(g_all_threads[i], 0, 0);
-			}
-		}
-	}
-bdev_create_fail:
-	{
-		struct host_fs_sync_ctx fini_ctx = {0};
-		spdk_bdev_finish(bdev_fini_done_cb, &fini_ctx);
-		while (!fini_ctx.done) {
-			spdk_thread_poll(g_host_thread, 0, 0);
-		}
-	}
-bdev_init_fail:
-	{
-		struct host_fs_sync_ctx fini_ctx = {0};
-		spdk_iobuf_finish(bdev_fini_done_cb, &fini_ctx);
-		while (!fini_ctx.done) {
-			spdk_thread_poll(g_host_thread, 0, 0);
-		}
-	}
-iobuf_init_fail:
-	{
-		struct host_fs_sync_ctx fini_ctx = {0};
-		spdk_accel_finish(bdev_fini_done_cb, &fini_ctx);
-		while (!fini_ctx.done) {
-			spdk_thread_poll(g_host_thread, 0, 0);
-		}
-	}
-accel_init_fail:
-	spdk_thread_exit(g_host_thread);
-	while (!spdk_thread_is_exited(g_host_thread)) {
-		spdk_thread_poll(g_host_thread, 0, 0);
-	}
-	spdk_thread_destroy(g_host_thread);
-	g_host_thread = NULL;
-thread_create_fail:
-	spdk_thread_lib_fini();
+fail:
+	host_fs_fini();
 	return rc;
 }
 
+/* Expose drive q's namespace through its own bdev and ublk disk /dev/ublkb<q>. */
+static int
+host_fs_add(uint32_t q, struct spdk_nvme_ns *ns)
+{
+	struct host_fs_sync_ctx ctx = {0};
+	char name[32];
+	int rc;
+
+	snprintf(name, sizeof(name), "%s%u", NVME_HOST_BDEV_PREFIX, q);
+	rc = nvme_host_bdev_create(q, name, ns);
+	if (rc) {
+		fprintf(stderr, "ERROR: nvme_host_bdev_create(%s) failed: %d\n", name, rc);
+		return rc;
+	}
+
+	ctx.id = q;
+	rc = ublk_start_disk(name, q, UBLK_DEV_NUM_QUEUE, UBLK_DEV_QUEUE_DEPTH,
+			     ublk_start_cb, &ctx);
+	if (rc) {
+		fprintf(stderr, "ERROR: ublk_start_disk(%s) failed: %d\n", name, rc);
+		return rc;
+	}
+	rc = host_fs_wait(&ctx.done, "ublk start disk");
+	if (rc) {
+		return rc;
+	}
+	if (ctx.rc) {
+		return ctx.rc;
+	}
+	g_ublk_started[q] = true;
+	return 0;
+}
+
 /*
- * Tear down the host filesystem path in reverse initialisation order.
+ * Tear down the host filesystem path in reverse initialisation order. Safe on a partial
+ * bring-up; a step that misses its deadline is reported and the teardown carries on.
  */
 static void
 host_fs_fini(void)
 {
-	struct host_fs_sync_ctx ctx = {0};
+	struct host_fs_sync_ctx ctx;
+	uint64_t deadline;
+	uint32_t q;
 	int i;
 
 	if (!g_host_thread) {
 		return;
 	}
+	spdk_set_thread(g_host_thread);
 
-	/* Stop the ublk disk first, then destroy the target. */
-	ctx = (struct host_fs_sync_ctx){0};
-	ublk_stop_disk(NVME_HOST_UBLK_ID, ublk_stop_cb, &ctx);
-	while (!ctx.done) {
-		for (i = 0; i < g_num_threads; i++) {
-			spdk_thread_poll(g_all_threads[i], 0, 0);
+	/* Stop every ublk disk first, then destroy the target. */
+	for (q = 0; q < IUVENTUS_MAX_PEERS; q++) {
+		if (!g_ublk_started[q]) {
+			continue;
 		}
+		ctx = (struct host_fs_sync_ctx){0};
+		if (ublk_stop_disk(q, ublk_stop_cb, &ctx) == 0) {
+			if (host_fs_wait(&ctx.done, "ublk stop disk") == 0) {
+				printf("/dev/ublkb%u stopped (%d)\n", q, ctx.rc);
+			}
+		}
+		g_ublk_started[q] = false;
 	}
 
 	/* Destroy the ublk target (tears down io_uring rings and threads). */
-	ctx = (struct host_fs_sync_ctx){0};
-	ublk_destroy_target(bdev_fini_done_cb, &ctx);
-	while (!ctx.done) {
-		for (i = 0; i < g_num_threads; i++) {
-			spdk_thread_poll(g_all_threads[i], 0, 0);
+	if (g_host_fs_stage >= HOST_FS_UBLK) {
+		ctx = (struct host_fs_sync_ctx){0};
+		if (ublk_destroy_target(bdev_fini_done_cb, &ctx) == 0) {
+			host_fs_wait(&ctx.done, "ublk destroy target");
 		}
 	}
 
 	/* Finalise the bdev subsystem (unregisters all bdevs). */
-	ctx = (struct host_fs_sync_ctx){0};
-	spdk_bdev_finish(bdev_fini_done_cb, &ctx);
-	while (!ctx.done) {
-		spdk_thread_poll(g_host_thread, 0, 0);
+	if (g_host_fs_stage >= HOST_FS_BDEV) {
+		ctx = (struct host_fs_sync_ctx){0};
+		spdk_bdev_finish(bdev_fini_done_cb, &ctx);
+		host_fs_wait(&ctx.done, "bdev finish");
+		memset(g_nvme_host_bdev, 0, sizeof(g_nvme_host_bdev));
 	}
 
-	/* Finalise the iobuf pool. */
-	ctx = (struct host_fs_sync_ctx){0};
-	spdk_iobuf_finish(bdev_fini_done_cb, &ctx);
-	while (!ctx.done) {
-		spdk_thread_poll(g_host_thread, 0, 0);
+	if (g_host_fs_stage >= HOST_FS_IOBUF) {
+		ctx = (struct host_fs_sync_ctx){0};
+		spdk_iobuf_finish(bdev_fini_done_cb, &ctx);
+		host_fs_wait(&ctx.done, "iobuf finish");
 	}
 
 	/* Finalise accel after all bdev channels have been torn down. */
-	ctx = (struct host_fs_sync_ctx){0};
-	spdk_accel_finish(bdev_fini_done_cb, &ctx);
-	while (!ctx.done) {
-		spdk_thread_poll(g_host_thread, 0, 0);
+	if (g_host_fs_stage >= HOST_FS_ACCEL) {
+		ctx = (struct host_fs_sync_ctx){0};
+		spdk_accel_finish(bdev_fini_done_cb, &ctx);
+		host_fs_wait(&ctx.done, "accel finish");
 	}
+	g_host_fs_stage = HOST_FS_NONE;
 
 	/*
 	 * ublk_destroy_target() already requests shutdown of ublk worker
 	 * threads on their own SPDK threads.  Only the current thread may call
 	 * spdk_thread_exit() directly, so request exit for any remaining
 	 * non-host threads via a message and destroy them only after they have
-	 * actually exited.
+	 * actually exited. A thread that does not exit in time is leaked, not waited on.
 	 */
 	for (i = 0; i < g_num_threads; i++) {
 		if (g_all_threads[i] != NULL && g_all_threads[i] != g_host_thread &&
@@ -754,21 +765,36 @@ host_fs_fini(void)
 		}
 	}
 
+	deadline = host_fs_now_ms() + HOST_FS_STEP_TIMEOUT_MS;
 	for (i = 0; i < g_num_threads; i++) {
 		if (g_all_threads[i] == NULL || g_all_threads[i] == g_host_thread) {
 			continue;
 		}
 
-		while (!spdk_thread_is_exited(g_all_threads[i])) {
+		while (!spdk_thread_is_exited(g_all_threads[i]) && host_fs_now_ms() <= deadline) {
 			spdk_thread_poll(g_all_threads[i], 0, 0);
+		}
+		if (!spdk_thread_is_exited(g_all_threads[i])) {
+			fprintf(stderr, "ERROR: host fs: thread %s did not exit, leaking it\n",
+				spdk_thread_get_name(g_all_threads[i]));
+			g_all_threads[i] = NULL;
+			continue;
 		}
 		spdk_thread_destroy(g_all_threads[i]);
 		g_all_threads[i] = NULL;
 	}
 
 	spdk_thread_exit(g_host_thread);
-	while (!spdk_thread_is_exited(g_host_thread)) {
+	deadline = host_fs_now_ms() + HOST_FS_STEP_TIMEOUT_MS;
+	while (!spdk_thread_is_exited(g_host_thread) && host_fs_now_ms() <= deadline) {
 		spdk_thread_poll(g_host_thread, 0, 0);
+	}
+	if (!spdk_thread_is_exited(g_host_thread)) {
+		/* spdk_thread_lib_fini() would assert on a live thread, so stop here. */
+		fprintf(stderr, "ERROR: host fs: host_fs thread did not exit; skipping lib fini\n");
+		g_host_thread = NULL;
+		g_num_threads = 0;
+		return;
 	}
 	spdk_thread_destroy(g_host_thread);
 
@@ -776,6 +802,7 @@ host_fs_fini(void)
 	g_num_threads = 0;
 
 	spdk_thread_lib_fini();
+	printf("Host filesystem path torn down\n");
 }
 
 /* ============================================================
@@ -800,6 +827,9 @@ static struct spdk_env_opts     g_env_opts;
 /* One admin-poll thread per drive. */
 static pthread_t                g_poll_thread[IUVENTUS_MAX_PEERS];
 static bool                     g_thread_started[IUVENTUS_MAX_PEERS];
+
+/* -U: drives (bit q = queue q's drive) whose namespace is also exposed to the host via ublk. */
+static uint32_t                 g_host_fs_mask = 0;
 
 static void
 sig_usr(int signo)
@@ -1035,13 +1065,14 @@ usage(void)
 	printf("Application options:\n");
 	printf("\t[-s do a subsystem reset (i.e. hard reset, the PCIe device can disappear from the system)]\n");
 	printf("\t[-r do a controller reset (i.e. soft reset)]\n");
-	printf("\t     Note: the NVMe namespace is exposed as /dev/ublkb%u via ublk.\n",
-	       NVME_HOST_UBLK_ID);
-	printf("\t           Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK=y.\n");
+	printf("\t[-P file to dump the PRP lists into]\n");
+	printf("\t[-U peer mask: bit q exposes queue q's drive to the host as /dev/ublkb<q> through\n");
+	printf("\t     its own host queue pair next to the card's (default 0 = none)]\n");
+	printf("\t     Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK (modprobe ublk_drv).\n");
 }
 
 /* Options this application owns; everything else belongs to the environment library. */
-#define APP_GETOPT_STRING "si:gm:L:rP:"
+#define APP_GETOPT_STRING "si:gm:L:rP:U:"
 
 static int
 app_parse(int ch, char *arg)
@@ -1056,6 +1087,20 @@ app_parse(int ch, char *arg)
 	case 'P':
 		g_prp_dump_path = arg;
 		break;
+	case 'U': {
+		char *end = NULL;
+		unsigned long mask;
+
+		errno = 0;
+		mask = strtoul(arg, &end, 0);
+		if (errno != 0 || end == arg || *end != '\0' || mask == 0 ||
+		    mask >= (1UL << IUVENTUS_MAX_PEERS)) {
+			fprintf(stderr, "Invalid -U peer mask '%s'\n", arg);
+			return -1;
+		}
+		g_host_fs_mask = (uint32_t)mask;
+		break;
+	}
 	case 'i':
 		g_env_opts.shm_id = spdk_strtol(arg, 10);
 		if (g_env_opts.shm_id < 0) {
@@ -1155,6 +1200,11 @@ main(int argc, char **argv)
 	if (rc != IUVENTUS_PARSE_ARGS_SUCCESS) {
 		return EXIT_FAILURE;
 	}
+	if (g_host_fs_mask >> iu_opts.num_peers) {
+		fprintf(stderr, "-U 0x%x names a drive past the %u given with -t\n",
+			g_host_fs_mask, iu_opts.num_peers);
+		return EXIT_FAILURE;
+	}
 
 	if (spdk_env_init(&g_env_opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
@@ -1191,24 +1241,24 @@ main(int argc, char **argv)
 	prp_list_dump(&iu_ctx, g_prp_dump_path);
 
 	/*
-	 * Initialise the host-side filesystem path.  This registers a thin
-	 * NVMe bdev backed by per-channel host software queue pairs and exposes
-	 * it via ublk so the host can format and mount a standard Linux
-	 * filesystem:
-	 *
-	 *   mkfs.ext4 /dev/ublkb0
-	 *   mount /dev/ublkb0 /mnt/nvme
-	 *
-	 * The card continues to use its own dedicated queue pair, so no
-	 * additional synchronisation between the two paths is required here.
+	 * Host-side filesystem path (-U): every selected drive gets a thin bdev backed by its own
+	 * host software queue pair, exposed via ublk as /dev/ublkb<q>. The card keeps its own
+	 * queue pair on the same drive, so the two paths need no synchronisation here.
 	 */
-	rc = 0; /* ublk/host-fs DISABLED for P2P counter test */
-	/* rc = host_fs_init(iuventus_peer(&iu_ctx, 0)->ns); */
-	if (rc) {
-		fprintf(stderr, "Warning: host filesystem (ublk) initialisation failed (%d).\n"
-			"The FPGA path will continue to operate normally.\n", rc);
-		/* Non-fatal: proceed without the host filesystem. */
-		rc = 0;
+	if (g_host_fs_mask != 0) {
+		rc = host_fs_lib_init();
+		for (i = 0; rc == 0 && i < iuventus_num_peers(&iu_ctx); i++) {
+			if (g_host_fs_mask & (1U << i)) {
+				rc = host_fs_add(i, iuventus_peer(&iu_ctx, i)->ns);
+			}
+		}
+		if (rc) {
+			fprintf(stderr, "Warning: host filesystem (ublk) initialisation failed (%d).\n"
+				"The FPGA path will continue to operate normally.\n", rc);
+			/* Non-fatal: proceed without the host filesystem. */
+			host_fs_fini();
+			rc = 0;
+		}
 	}
 
 	rc = iuventus_enable(&iu_ctx);
@@ -1247,11 +1297,8 @@ main(int argc, char **argv)
 	 * CPU core; all of them are tracked in g_all_threads[].
 	 */
 	while (!stop) {
-		int t;
+		int busy = host_fs_poll_all();
 
-		for (t = 0; t < g_num_threads; t++) {
-			spdk_thread_poll(g_all_threads[t], 0, 0);
-		}
 		/* Drives whose poll thread could not start are serviced here. */
 		for (i = 0; i < iuventus_num_peers(&iu_ctx); i++) {
 			if (!g_thread_started[i]) {
@@ -1268,7 +1315,10 @@ main(int argc, char **argv)
 				dump_nvme_logs(peer->ctrlr, "POST-WEDGE");
 			}
 		}
-		usleep(1000);
+		/* Back off only while every poller is idle; a short nap keeps host I/O latency low. */
+		if (!busy) {
+			usleep(g_num_threads > 0 ? 50 : 1000);
+		}
 	}
 
 	/* Stop the pollers before touching any controller from this thread again. */
@@ -1285,7 +1335,7 @@ main(int argc, char **argv)
 	}
 
 	/* Tear down the host filesystem before any lower-level cleanup. */
-	/* host_fs_fini(); ublk/host-fs teardown DISABLED for P2P counter test */
+	host_fs_fini();
 
 	for (i = 0; i < iuventus_num_peers(&iu_ctx); i++) {
 		rd_ctrl_regs(iuventus_peer(&iu_ctx, i)->ctrlr);
