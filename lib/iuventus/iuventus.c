@@ -30,6 +30,15 @@
 #define REG_WRBUFF_PRP_LIST_PTR 0x020
 #define REG_META_PTR            0x028
 #define REG_RD_PAGES_FREE       0x0F4
+/* EP1 block: mirrors the COMMON block above, one-for-one, for the second bifurcated endpoint's
+ * data pool. Reached through the same nfb component as everything else -- MI registers are
+ * EP0-only, even though EP1's BARs and PCIe device are not. Absent on single-endpoint firmware. */
+#define REG_EP1_RDBUFF_BADDR        0x180
+#define REG_EP1_RDBUFF_PRP_LIST_PTR 0x188
+#define REG_EP1_WRBUFF_BADDR        0x190
+#define REG_EP1_WRBUFF_PRP_LIST_PTR 0x198
+#define REG_EP1_RD_PAGES_FREE       0x1A0
+#define REG_EP1_WR_PAGES_FREE       0x1A4
 /* The queues live in their own BARs rather than at the head of the data pool, so page 0 is data
  * page 0. The card does hold back one page per PRP list page group, but those sit at the top of
  * each group, not at index 0, and the list must still carry an entry for every index below them. */
@@ -38,7 +47,7 @@
  * base + page_idx*8 over this whole range, so the list has to be this many entries or it
  * reads past the allocation -- silently, since the drive just gets whatever follows in the
  * hugepage. */
-#define MANAGED_PAGES           1024
+#define MANAGED_PAGES           2048
 /* NVMe 2.0e 4.1.2 confines a PRP List to ONE memory page and reaches any further page only
  * through a chain pointer in that page's last entry, which the card does not emit. The list may
  * still span pages: the card's allocator holds back the last page of every group, so no granted
@@ -77,6 +86,11 @@ _Static_assert(MANAGED_PAGES % PRP_LIST_ENTRIES_PER_PAGE == 0,
  * usable index, 4 (also 64-bit, consuming 4 and 5). */
 #define RDBUFF_BAR 4
 
+/* Device ids of the peer-BAR function on each endpoint, used to tell EP0 and EP1 apart on attach
+ * rather than trusting the order they were found in. */
+#define NCD_EP0_DEVICE_ID 0xc020
+#define NCD_EP1_DEVICE_ID 0xc022
+
 /* Options this library takes off the command line before the caller sees it. */
 #define IUVENTUS_GETOPT_STRING "hd:t:q:RQ:N:"
 
@@ -90,6 +104,20 @@ static struct spdk_pci_id ncd_pci_driver_id[] = {
 };
 
 SPDK_PCI_DRIVER_REGISTER(ncd, ncd_pci_driver_id, SPDK_PCI_DRIVER_NEED_MAPPING)
+
+/* Separate driver, id-scoped to EP1's peer-BAR device id alone: spdk_pci_enumerate() attaches
+ * whatever its driver's table matches, so a table shared with "ncd" would risk grabbing an
+ * unrelated card's EP0 during the EP1 PCI scan in dma_dev_ep1_locate(). */
+static struct spdk_pci_id ncd_ep1_pci_driver_id[] = {
+	{
+		SPDK_PCI_DEVICE(0x18ec, 0xc022)
+	},
+	{
+		SPDK_PCI_DEVICE(0x1c2c, 0xc022)
+	},
+};
+
+SPDK_PCI_DRIVER_REGISTER(ncd_ep1, ncd_ep1_pci_driver_id, SPDK_PCI_DRIVER_NEED_MAPPING)
 
 struct admin_cmd_ctx {
 	const char	*cmd_name;
@@ -358,10 +386,11 @@ queues_alloc(struct iuventus_ctx *ctx)
 
 	for (q = 0; q < ctx->num_peers; q++) {
 		struct iuventus_peer *peer = &ctx->peers[q];
-		void *sq_vaddr = (uint8_t *)ctx->sq.vaddr + (uint64_t)q * VALUE_4KB;
-		uint64_t sq_paddr = ctx->sq.paddr + (uint64_t)q * VALUE_4KB;
-		void *cq_vaddr = (uint8_t *)ctx->cq.vaddr + (uint64_t)q * VALUE_4KB;
-		uint64_t cq_paddr = ctx->cq.paddr + (uint64_t)q * VALUE_4KB;
+		const struct iuventus_ep *ep = &ctx->ep[iuventus_queue_ep(ctx, q)];
+		void *sq_vaddr = (uint8_t *)ep->sq.vaddr + (uint64_t)q * VALUE_4KB;
+		uint64_t sq_paddr = ep->sq.paddr + (uint64_t)q * VALUE_4KB;
+		void *cq_vaddr = (uint8_t *)ep->cq.vaddr + (uint64_t)q * VALUE_4KB;
+		uint64_t cq_paddr = ep->cq.paddr + (uint64_t)q * VALUE_4KB;
 		uint8_t *cpl_buff;
 		int32_t qid;
 		uint32_t i;
@@ -483,42 +512,200 @@ dma_dev_fini(struct iuventus_ctx *ctx)
 	ctx->pcie_bdf = NULL;
 }
 
-static void
-prp_list_free(struct iuventus_ctx *ctx)
+/* PCIe slot of the card's second endpoint, as named by the device tree. The nfb driver only
+ * fills "pci-slot" into "/system/device/endpointN" for a function it probes, and EP1's PF0 is
+ * deliberately device id 0xc021 -- a dummy the nfb driver never touches -- so this misses on
+ * every firmware built so far. Kept for forward compatibility only; dma_dev_ep1_locate() falls
+ * back to a PCI scan when it does. */
+static bool
+dma_dev_ep1_fdt_bdf(struct iuventus_ctx *ctx, const char **bdf)
 {
-	if (!ctx->prp_lists_allocated) {
-		return;
-	}
+	const void *fdt;
+	int fdt_offset;
+	int len;
 
-	spdk_dma_free(ctx->wrbuff_prp_list.vaddr);
-	spdk_dma_free(ctx->rdbuff_prp_list.vaddr);
-	memset(&ctx->wrbuff_prp_list, 0, sizeof(ctx->wrbuff_prp_list));
-	memset(&ctx->rdbuff_prp_list, 0, sizeof(ctx->rdbuff_prp_list));
-	ctx->prp_lists_allocated = false;
+	fdt = nfb_get_fdt(ctx->nfb_dev);
+	fdt_offset = fdt_path_offset(fdt, "/system/device/endpoint1");
+	*bdf = fdt_getprop(fdt, fdt_offset, "pci-slot", &len);
+
+	return len >= 0 && *bdf != NULL;
+}
+
+/* Collects every PCIe address spdk_pci_enumerate() offers while scanning for EP1's peer-BAR
+ * device id -- never attaches on its own. Only the count and the first couple of addresses are
+ * kept, just enough to fail loudly and name the offending BDFs if more than one card is present. */
+#define EP1_SCAN_LOG_MAX 2
+struct ep1_scan_ctx {
+	struct spdk_pci_addr	addr[EP1_SCAN_LOG_MAX];
+	uint32_t		count;
+};
+
+static int
+ep1_scan_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
+{
+	struct ep1_scan_ctx *sctx = cb_ctx;
+
+	if (sctx->count < EP1_SCAN_LOG_MAX) {
+		sctx->addr[sctx->count] = spdk_pci_device_get_addr(pci_dev);
+	}
+	sctx->count++;
+
+	/* Report only -- the caller attaches by address afterwards, once it knows there is
+	 * exactly one match. */
+	return 1;
+}
+
+/*
+ * Locates the card's second endpoint's peer-BAR function, without attaching it.
+ *
+ * Tries the device tree first (see dma_dev_ep1_fdt_bdf()); on a miss, falls back to a PCI scan
+ * for NCD_EP1_DEVICE_ID. Zero matches means single-endpoint firmware, which is not an error.
+ * More than one match is refused rather than guessed at: a second bifurcated card would need
+ * serial matching, which this library does not support.
+ *
+ * \param ep1_driver Driver whose id table is scoped to NCD_EP1_DEVICE_ID alone.
+ * \param addr Filled in with EP1's peer-BAR address when *found comes back true.
+ * \param found Set to whether an endpoint 1 was located.
+ * \return 0 on success (including the "not found" case), negative errno on a real error.
+ */
+/* The bridge above a function, as sysfs names it ("0000:00:01.2"); false when sysfs has no
+ * such device. The two endpoints of one bifurcated slot hang off root ports that differ only
+ * in function, which is what tells one card's endpoint 1 from another's. */
+static bool
+pci_parent_bdf(const struct spdk_pci_addr *a, char *out, size_t len)
+{
+	char path[128];
+	char real[PATH_MAX];
+	const char *base;
+
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%x/..", a->domain, a->bus,
+		 a->dev, a->func);
+	if (realpath(path, real) == NULL) {
+		return false;
+	}
+	base = strrchr(real, '/');
+	if (base == NULL) {
+		return false;
+	}
+	snprintf(out, len, "%s", base + 1);
+	return true;
 }
 
 static int
-prp_list_alloc(struct iuventus_ctx *ctx)
+dma_dev_ep1_locate(struct iuventus_ctx *ctx, struct spdk_pci_driver *ep1_driver,
+		   struct spdk_pci_addr *addr, bool *found)
+{
+	const char *bdf;
+	struct ep1_scan_ctx sctx = {0};
+	int rc;
+
+	*found = false;
+
+	if (dma_dev_ep1_fdt_bdf(ctx, &bdf)) {
+		rc = spdk_pci_addr_parse(addr, bdf);
+		if (rc) {
+			SPDK_ERRLOG("endpoint 1: device tree pci-slot '%s' does not parse\n", bdf);
+			return -EINVAL;
+		}
+		/* Mirrors endpoint 0: the device tree names the management function, the peer BAR
+		 * is the next one over. */
+		addr->func += 1;
+		SPDK_NOTICELOG("endpoint 1: found via device tree at %04x:%02x:%02x.%x\n",
+			       addr->domain, addr->bus, addr->dev, addr->func);
+		*found = true;
+		return 0;
+	}
+
+	rc = spdk_pci_enumerate(ep1_driver, ep1_scan_cb, &sctx);
+	if (rc != 0) {
+		SPDK_ERRLOG("endpoint 1: PCI scan for device id 0x%04x failed\n", NCD_EP1_DEVICE_ID);
+		return -ENODEV;
+	}
+
+	if (sctx.count == 0) {
+		return 0;
+	}
+
+	if (sctx.count > 1) {
+		/* Several bifurcated cards: keep the candidate whose root port is the sibling of
+		 * endpoint 0's (same domain, bus and device, other function). *addr still holds
+		 * endpoint 0's peer-BAR address on entry. */
+		char ep0_parent[32];
+		char parent[32];
+		uint32_t i;
+		uint32_t hits = 0;
+		uint32_t hit = 0;
+
+		if (sctx.count > EP1_SCAN_LOG_MAX || !pci_parent_bdf(addr, ep0_parent, sizeof(ep0_parent))) {
+			SPDK_ERRLOG("endpoint 1: %u devices with id 0x%04x found and endpoint 0's root "
+				    "port is unknown -- cannot tell the cards apart\n",
+				    sctx.count, NCD_EP1_DEVICE_ID);
+			return -ENODEV;
+		}
+		for (i = 0; i < sctx.count; i++) {
+			if (pci_parent_bdf(&sctx.addr[i], parent, sizeof(parent)) &&
+			    strncmp(parent, ep0_parent, 10) == 0 && strcmp(parent, ep0_parent) != 0) {
+				hits++;
+				hit = i;
+			}
+		}
+		if (hits != 1) {
+			SPDK_ERRLOG("endpoint 1: %u devices with id 0x%04x found, %u of them beside "
+				    "endpoint 0's root port %s -- cannot tell the cards apart\n",
+				    sctx.count, NCD_EP1_DEVICE_ID, hits, ep0_parent);
+			return -ENODEV;
+		}
+		*addr = sctx.addr[hit];
+		SPDK_NOTICELOG("endpoint 1: %u candidates, took %04x:%02x:%02x.%x beside endpoint 0's "
+			       "root port %s\n", sctx.count, addr->domain, addr->bus, addr->dev,
+			       addr->func, ep0_parent);
+		*found = true;
+		return 0;
+	}
+
+	*addr = sctx.addr[0];
+	SPDK_NOTICELOG("endpoint 1: found via PCI scan at %04x:%02x:%02x.%x\n", addr->domain,
+		       addr->bus, addr->dev, addr->func);
+	*found = true;
+	return 0;
+}
+
+static void
+prp_list_free(struct iuventus_ep *ep)
+{
+	if (!ep->prp_lists_allocated) {
+		return;
+	}
+
+	spdk_dma_free(ep->wrbuff_prp_list.vaddr);
+	spdk_dma_free(ep->rdbuff_prp_list.vaddr);
+	memset(&ep->wrbuff_prp_list, 0, sizeof(ep->wrbuff_prp_list));
+	memset(&ep->rdbuff_prp_list, 0, sizeof(ep->rdbuff_prp_list));
+	ep->prp_lists_allocated = false;
+}
+
+static int
+prp_list_alloc(struct iuventus_ep *ep)
 {
 	uint64_t size = PRP_LIST_BYTES;
 	int i;
 	int rc;
 
-	ctx->wrbuff_prp_list.vaddr = spdk_dma_zmalloc(PRP_LIST_BYTES, VALUE_4KB, NULL);
-	if (ctx->wrbuff_prp_list.vaddr == NULL) {
+	ep->wrbuff_prp_list.vaddr = spdk_dma_zmalloc(PRP_LIST_BYTES, VALUE_4KB, NULL);
+	if (ep->wrbuff_prp_list.vaddr == NULL) {
 		SPDK_ERRLOG("Write PRP list allocation failed\n");
 		return -ENOMEM;
 	}
 
-	ctx->rdbuff_prp_list.vaddr = spdk_dma_zmalloc(PRP_LIST_BYTES, VALUE_4KB, NULL);
-	if (ctx->rdbuff_prp_list.vaddr == NULL) {
+	ep->rdbuff_prp_list.vaddr = spdk_dma_zmalloc(PRP_LIST_BYTES, VALUE_4KB, NULL);
+	if (ep->rdbuff_prp_list.vaddr == NULL) {
 		SPDK_ERRLOG("Read PRP list allocation failed\n");
 		rc = -ENOMEM;
 		goto fail;
 	}
 
-	ctx->wrbuff_prp_list.paddr = spdk_vtophys(ctx->wrbuff_prp_list.vaddr, &size);
-	if (ctx->wrbuff_prp_list.paddr == SPDK_VTOPHYS_ERROR) {
+	ep->wrbuff_prp_list.paddr = spdk_vtophys(ep->wrbuff_prp_list.vaddr, &size);
+	if (ep->wrbuff_prp_list.paddr == SPDK_VTOPHYS_ERROR) {
 		SPDK_ERRLOG("Failed to get physical address of the Write PRP list buffer\n");
 		rc = -EFAULT;
 		goto fail;
@@ -531,8 +718,8 @@ prp_list_alloc(struct iuventus_ctx *ctx)
 		goto fail;
 	}
 
-	ctx->rdbuff_prp_list.paddr = spdk_vtophys(ctx->rdbuff_prp_list.vaddr, &size);
-	if (ctx->rdbuff_prp_list.paddr == SPDK_VTOPHYS_ERROR) {
+	ep->rdbuff_prp_list.paddr = spdk_vtophys(ep->rdbuff_prp_list.vaddr, &size);
+	if (ep->rdbuff_prp_list.paddr == SPDK_VTOPHYS_ERROR) {
 		SPDK_ERRLOG("Failed to get physical address of the Read PRP list buffer\n");
 		rc = -EFAULT;
 		goto fail;
@@ -548,41 +735,45 @@ prp_list_alloc(struct iuventus_ctx *ctx)
 	/* The card can hand out any page in [0, MANAGED_PAGES), so every entry must be valid. A
 	 * data BAR smaller than that would let it address past the window -- refuse rather than
 	 * leave zeroed entries pointing at physical address 0. */
-	if (ctx->wrbuff.size < (uint64_t)MANAGED_PAGES * VALUE_4KB ||
-	    ctx->rdbuff.size < (uint64_t)MANAGED_PAGES * VALUE_4KB) {
+	if (ep->wrbuff.size < (uint64_t)MANAGED_PAGES * VALUE_4KB ||
+	    ep->rdbuff.size < (uint64_t)MANAGED_PAGES * VALUE_4KB) {
 		SPDK_ERRLOG("data BARs too small for %d managed pages (wrbuff %llu B, "
 			    "rdbuff %llu B, need %llu B each)\n",
-			    MANAGED_PAGES, (unsigned long long)ctx->wrbuff.size,
-			    (unsigned long long)ctx->rdbuff.size,
+			    MANAGED_PAGES, (unsigned long long)ep->wrbuff.size,
+			    (unsigned long long)ep->rdbuff.size,
 			    (unsigned long long)MANAGED_PAGES * VALUE_4KB);
 		rc = -ENOSPC;
 		goto fail;
 	}
 
 	for (i = FIRST_DATA_PAGE; i < MANAGED_PAGES; i++) {
-		((uint64_t *)ctx->wrbuff_prp_list.vaddr)[i - FIRST_DATA_PAGE] =
-			ctx->wrbuff.paddr + ((uint64_t)i * VALUE_4KB);
-		((uint64_t *)ctx->rdbuff_prp_list.vaddr)[i - FIRST_DATA_PAGE] =
-			ctx->rdbuff.paddr + ((uint64_t)i * VALUE_4KB);
+		((uint64_t *)ep->wrbuff_prp_list.vaddr)[i - FIRST_DATA_PAGE] =
+			ep->wrbuff.paddr + ((uint64_t)i * VALUE_4KB);
+		((uint64_t *)ep->rdbuff_prp_list.vaddr)[i - FIRST_DATA_PAGE] =
+			ep->rdbuff.paddr + ((uint64_t)i * VALUE_4KB);
 	}
-	ctx->wrbuff_prp_list.entries = MANAGED_PAGES - FIRST_DATA_PAGE;
-	ctx->rdbuff_prp_list.entries = MANAGED_PAGES - FIRST_DATA_PAGE;
-	ctx->prp_lists_allocated = true;
+	ep->wrbuff_prp_list.entries = MANAGED_PAGES - FIRST_DATA_PAGE;
+	ep->rdbuff_prp_list.entries = MANAGED_PAGES - FIRST_DATA_PAGE;
+	ep->prp_lists_allocated = true;
 
 	return 0;
 
 fail:
-	spdk_dma_free(ctx->wrbuff_prp_list.vaddr);
-	spdk_dma_free(ctx->rdbuff_prp_list.vaddr);
-	memset(&ctx->wrbuff_prp_list, 0, sizeof(ctx->wrbuff_prp_list));
-	memset(&ctx->rdbuff_prp_list, 0, sizeof(ctx->rdbuff_prp_list));
+	spdk_dma_free(ep->wrbuff_prp_list.vaddr);
+	spdk_dma_free(ep->rdbuff_prp_list.vaddr);
+	memset(&ep->wrbuff_prp_list, 0, sizeof(ep->wrbuff_prp_list));
+	memset(&ep->rdbuff_prp_list, 0, sizeof(ep->rdbuff_prp_list));
 	return rc;
 }
 
 static void
 dma_ctrl_deinit(struct iuventus_ctx *ctx)
 {
-	prp_list_free(ctx);
+	uint32_t e;
+
+	for (e = 0; e < ctx->num_eps; e++) {
+		prp_list_free(&ctx->ep[e]);
+	}
 	if (ctx->nfb_comp != NULL) {
 		nfb_comp_close(ctx->nfb_comp);
 		ctx->nfb_comp = NULL;
@@ -593,6 +784,7 @@ static int
 dma_ctrl_init(struct iuventus_ctx *ctx)
 {
 	uint32_t q;
+	uint32_t e;
 	int node;
 	int rc;
 
@@ -603,20 +795,35 @@ dma_ctrl_init(struct iuventus_ctx *ctx)
 		return -ENODEV;
 	}
 
-	rc = prp_list_alloc(ctx);
-	if (rc) {
-		SPDK_ERRLOG("PRP list allocation failed\n");
-		nfb_comp_close(ctx->nfb_comp);
-		ctx->nfb_comp = NULL;
-		return rc;
+	for (e = 0; e < ctx->num_eps; e++) {
+		rc = prp_list_alloc(&ctx->ep[e]);
+		if (rc) {
+			SPDK_ERRLOG("PRP list allocation failed for endpoint %u\n", e);
+			while (e-- > 0) {
+				prp_list_free(&ctx->ep[e]);
+			}
+			nfb_comp_close(ctx->nfb_comp);
+			ctx->nfb_comp = NULL;
+			return rc;
+		}
 	}
 
-	/* COMMON: the shared data pool and its metadata. */
-	nfb_comp_write64(ctx->nfb_comp, REG_RDBUFF_BADDR, ctx->rdbuff.paddr);
-	nfb_comp_write64(ctx->nfb_comp, REG_RDBUFF_PRP_LIST_PTR, ctx->rdbuff_prp_list.paddr);
-	nfb_comp_write64(ctx->nfb_comp, REG_WRBUFF_BADDR, ctx->wrbuff.paddr);
-	nfb_comp_write64(ctx->nfb_comp, REG_WRBUFF_PRP_LIST_PTR, ctx->wrbuff_prp_list.paddr);
+	/* COMMON: EP0's data pool and its metadata. */
+	nfb_comp_write64(ctx->nfb_comp, REG_RDBUFF_BADDR, ctx->ep[0].rdbuff.paddr);
+	nfb_comp_write64(ctx->nfb_comp, REG_RDBUFF_PRP_LIST_PTR, ctx->ep[0].rdbuff_prp_list.paddr);
+	nfb_comp_write64(ctx->nfb_comp, REG_WRBUFF_BADDR, ctx->ep[0].wrbuff.paddr);
+	nfb_comp_write64(ctx->nfb_comp, REG_WRBUFF_PRP_LIST_PTR, ctx->ep[0].wrbuff_prp_list.paddr);
 	nfb_comp_write64(ctx->nfb_comp, REG_META_PTR, 0);
+
+	/* EP1: same fields as COMMON above, one endpoint over, present only on bifurcated firmware. */
+	if (ctx->num_eps > 1) {
+		nfb_comp_write64(ctx->nfb_comp, REG_EP1_RDBUFF_BADDR, ctx->ep[1].rdbuff.paddr);
+		nfb_comp_write64(ctx->nfb_comp, REG_EP1_RDBUFF_PRP_LIST_PTR,
+				 ctx->ep[1].rdbuff_prp_list.paddr);
+		nfb_comp_write64(ctx->nfb_comp, REG_EP1_WRBUFF_BADDR, ctx->ep[1].wrbuff.paddr);
+		nfb_comp_write64(ctx->nfb_comp, REG_EP1_WRBUFF_PRP_LIST_PTR,
+				 ctx->ep[1].wrbuff_prp_list.paddr);
+	}
 
 	/* PER-QUEUE: one block per card queue, each pointing at its own drive's doorbells. */
 	for (q = 0; q < ctx->num_peers; q++) {
@@ -633,14 +840,33 @@ dma_ctrl_init(struct iuventus_ctx *ctx)
 	return 0;
 }
 
+/* Passed as the enum_ctx of spdk_pci_device_attach() for one endpoint's peer-BAR function: which
+ * ctx->ep[] slot to fill in, and the device id that slot is expected to attach as -- checked
+ * rather than assumed, so a BDF mix-up fails loudly instead of silently swapping the endpoints. */
+struct ep_attach_ctx {
+	struct iuventus_ctx	*ctx;
+	uint32_t		ep_idx;
+	uint16_t		expect_device_id;
+};
+
 static int
 ncd_drv_attach_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
 {
-	struct iuventus_ctx *ctx = cb_ctx;
+	struct ep_attach_ctx *actx = cb_ctx;
+	struct iuventus_ep *ep = &actx->ctx->ep[actx->ep_idx];
+	struct spdk_pci_id id;
 	uint16_t cmd_reg;
 	int rc;
 
-	ctx->pci_dev = pci_dev;
+	id = spdk_pci_device_get_id(pci_dev);
+	if (id.device_id != actx->expect_device_id) {
+		SPDK_ERRLOG("endpoint %u: attached device id 0x%04x, expected 0x%04x -- refusing to "
+			    "guess which endpoint this is\n", actx->ep_idx, id.device_id,
+			    actx->expect_device_id);
+		return -1;
+	}
+
+	ep->pci_dev = pci_dev;
 
 	/* Enable memory accesses and PCI bus mastering, and disable INTx. The device itself is
 	 * already enabled by the uio bind, so only the command register needs touching. */
@@ -648,17 +874,15 @@ ncd_drv_attach_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
 	cmd_reg |= 0x404;
 	spdk_pci_device_cfg_write16(pci_dev, cmd_reg, 4);
 
-	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR, &ctx->sq.vaddr, &ctx->sq.paddr,
-				     &ctx->sq.size);
+	rc = spdk_pci_device_map_bar(pci_dev, SQ_BAR, &ep->sq.vaddr, &ep->sq.paddr, &ep->sq.size);
 	if (rc) {
-		SPDK_ERRLOG("Unable to map BAR %d (SQ)\n", SQ_BAR);
+		SPDK_ERRLOG("endpoint %u: unable to map BAR %d (SQ)\n", actx->ep_idx, SQ_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR, &ctx->cq.vaddr, &ctx->cq.paddr,
-				     &ctx->cq.size);
+	rc = spdk_pci_device_map_bar(pci_dev, CQ_BAR, &ep->cq.vaddr, &ep->cq.paddr, &ep->cq.size);
 	if (rc) {
-		SPDK_ERRLOG("Unable to map BAR %d (CQ)\n", CQ_BAR);
+		SPDK_ERRLOG("endpoint %u: unable to map BAR %d (CQ)\n", actx->ep_idx, CQ_BAR);
 		return rc;
 	}
 
@@ -666,33 +890,33 @@ ncd_drv_attach_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
 	 * data pools in their own large 64-bit BARs. They are not aliases of the queue BARs, and
 	 * mapping them separately is what makes the card's page index and this host's addresses
 	 * agree. */
-	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &ctx->wrbuff.vaddr, &ctx->wrbuff.paddr,
-				     &ctx->wrbuff.size);
+	rc = spdk_pci_device_map_bar(pci_dev, WRBUFF_BAR, &ep->wrbuff.vaddr, &ep->wrbuff.paddr,
+				     &ep->wrbuff.size);
 	if (rc) {
-		SPDK_ERRLOG("Unable to map BAR %d (WRBUFF)\n", WRBUFF_BAR);
+		SPDK_ERRLOG("endpoint %u: unable to map BAR %d (WRBUFF)\n", actx->ep_idx, WRBUFF_BAR);
 		return rc;
 	}
 
-	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &ctx->rdbuff.vaddr, &ctx->rdbuff.paddr,
-				     &ctx->rdbuff.size);
+	rc = spdk_pci_device_map_bar(pci_dev, RDBUFF_BAR, &ep->rdbuff.vaddr, &ep->rdbuff.paddr,
+				     &ep->rdbuff.size);
 	if (rc) {
-		SPDK_ERRLOG("Unable to map BAR %d (RDBUFF)\n", RDBUFF_BAR);
+		SPDK_ERRLOG("endpoint %u: unable to map BAR %d (RDBUFF)\n", actx->ep_idx, RDBUFF_BAR);
 		return rc;
 	}
 
-	if (ctx->sq.vaddr == NULL || ctx->cq.vaddr == NULL ||
-	    ctx->wrbuff.vaddr == NULL || ctx->rdbuff.vaddr == NULL) {
-		SPDK_ERRLOG("Virtual BAR addresses invalid!\n");
+	if (ep->sq.vaddr == NULL || ep->cq.vaddr == NULL ||
+	    ep->wrbuff.vaddr == NULL || ep->rdbuff.vaddr == NULL) {
+		SPDK_ERRLOG("endpoint %u: virtual BAR addresses invalid!\n", actx->ep_idx);
 		return -EFAULT;
 	}
-	if (ctx->sq.paddr == 0 || ctx->cq.paddr == 0 ||
-	    ctx->wrbuff.paddr == 0 || ctx->rdbuff.paddr == 0) {
-		SPDK_ERRLOG("Physical BAR addresses invalid!\n");
+	if (ep->sq.paddr == 0 || ep->cq.paddr == 0 ||
+	    ep->wrbuff.paddr == 0 || ep->rdbuff.paddr == 0) {
+		SPDK_ERRLOG("endpoint %u: physical BAR addresses invalid!\n", actx->ep_idx);
 		return -EFAULT;
 	}
-	if (ctx->sq.size == 0 || ctx->cq.size == 0 ||
-	    ctx->wrbuff.size == 0 || ctx->rdbuff.size == 0) {
-		SPDK_ERRLOG("BAR sizes invalid!\n");
+	if (ep->sq.size == 0 || ep->cq.size == 0 ||
+	    ep->wrbuff.size == 0 || ep->rdbuff.size == 0) {
+		SPDK_ERRLOG("endpoint %u: BAR sizes invalid!\n", actx->ep_idx);
 		return -EFAULT;
 	}
 
@@ -702,15 +926,25 @@ ncd_drv_attach_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
 static void
 bars_print(const struct iuventus_ctx *ctx)
 {
-	SPDK_NOTICELOG("PCIe domain initialization complete\n");
-	SPDK_NOTICELOG("\tSQ     VADDR %p PADDR 0x%lx size %lu B\n",
-		       ctx->sq.vaddr, ctx->sq.paddr, ctx->sq.size);
-	SPDK_NOTICELOG("\tCQ     VADDR %p PADDR 0x%lx size %lu B\n",
-		       ctx->cq.vaddr, ctx->cq.paddr, ctx->cq.size);
-	SPDK_NOTICELOG("\tWRBUFF VADDR %p PADDR 0x%lx size %lu B\n",
-		       ctx->wrbuff.vaddr, ctx->wrbuff.paddr, ctx->wrbuff.size);
-	SPDK_NOTICELOG("\tRDBUFF VADDR %p PADDR 0x%lx size %lu B\n",
-		       ctx->rdbuff.vaddr, ctx->rdbuff.paddr, ctx->rdbuff.size);
+	uint32_t e;
+
+	SPDK_NOTICELOG("PCIe domain initialization complete, %u endpoint(s)\n", ctx->num_eps);
+	for (e = 0; e < ctx->num_eps; e++) {
+		const struct iuventus_ep *ep = &ctx->ep[e];
+		struct spdk_pci_addr addr = spdk_pci_device_get_addr(ep->pci_dev);
+		struct spdk_pci_id id = spdk_pci_device_get_id(ep->pci_dev);
+
+		SPDK_NOTICELOG("Endpoint %u: %04x:%02x:%02x.%x, device id 0x%04x\n", e, addr.domain,
+			       addr.bus, addr.dev, addr.func, id.device_id);
+		SPDK_NOTICELOG("\tSQ     VADDR %p PADDR 0x%lx size %lu B\n",
+			       ep->sq.vaddr, ep->sq.paddr, ep->sq.size);
+		SPDK_NOTICELOG("\tCQ     VADDR %p PADDR 0x%lx size %lu B\n",
+			       ep->cq.vaddr, ep->cq.paddr, ep->cq.size);
+		SPDK_NOTICELOG("\tWRBUFF VADDR %p PADDR 0x%lx size %lu B\n",
+			       ep->wrbuff.vaddr, ep->wrbuff.paddr, ep->wrbuff.size);
+		SPDK_NOTICELOG("\tRDBUFF VADDR %p PADDR 0x%lx size %lu B\n",
+			       ep->rdbuff.vaddr, ep->rdbuff.paddr, ep->rdbuff.size);
+	}
 }
 
 void
@@ -859,7 +1093,11 @@ int
 iuventus_init(struct iuventus_ctx *ctx, const struct iuventus_opts *opts)
 {
 	struct spdk_pci_driver *ncd_driver;
+	struct spdk_pci_driver *ncd_ep1_driver;
 	struct spdk_pci_addr pcie_addr;
+	struct ep_attach_ctx ep_actx;
+	bool ep1_found;
+	uint32_t attached_eps = 0;
 	uint32_t q;
 	int rc;
 
@@ -924,6 +1162,13 @@ iuventus_init(struct iuventus_ctx *ctx, const struct iuventus_opts *opts)
 		goto probe_fail;
 	}
 
+	ncd_ep1_driver = spdk_pci_get_driver("ncd_ep1");
+	if (ncd_ep1_driver == NULL) {
+		SPDK_ERRLOG("Unable to get the NCD EP1 driver!\n");
+		rc = -ENODEV;
+		goto probe_fail;
+	}
+
 	rc = dma_dev_init(ctx, opts->nfb_dev != NULL ? opts->nfb_dev : "0");
 	if (rc) {
 		SPDK_ERRLOG("Error initializing the NFB device\n");
@@ -941,11 +1186,45 @@ iuventus_init(struct iuventus_ctx *ctx, const struct iuventus_opts *opts)
 	 * function of the same device. */
 	pcie_addr.func += 1;
 
-	rc = spdk_pci_device_attach(ncd_driver, ncd_drv_attach_cb, ctx, &pcie_addr);
+	ep_actx.ctx = ctx;
+	ep_actx.ep_idx = 0;
+	ep_actx.expect_device_id = NCD_EP0_DEVICE_ID;
+	rc = spdk_pci_device_attach(ncd_driver, ncd_drv_attach_cb, &ep_actx, &pcie_addr);
 	if (rc) {
-		SPDK_ERRLOG("Unable to attach the PCIe device!\n");
+		SPDK_ERRLOG("Unable to attach endpoint 0's PCIe device!\n");
 		rc = -ENODEV;
 		goto pci_attach_fail;
+	}
+	attached_eps = 1;
+
+	/* A second endpoint is optional: its absence is not an error -- every queue simply stays on
+	 * endpoint 0. See dma_dev_ep1_locate() for how it is found. */
+	rc = dma_dev_ep1_locate(ctx, ncd_ep1_driver, &pcie_addr, &ep1_found);
+	if (rc) {
+		rc = -ENODEV;
+		goto eps_attach_fail;
+	}
+	if (ep1_found) {
+		ep_actx.ctx = ctx;
+		ep_actx.ep_idx = 1;
+		ep_actx.expect_device_id = NCD_EP1_DEVICE_ID;
+		rc = spdk_pci_device_attach(ncd_ep1_driver, ncd_drv_attach_cb, &ep_actx, &pcie_addr);
+		if (rc) {
+			SPDK_ERRLOG("Unable to attach endpoint 1's PCIe device!\n");
+			rc = -ENODEV;
+			goto eps_attach_fail;
+		}
+		attached_eps = 2;
+	}
+	ctx->num_eps = attached_eps;
+
+	/* The card splits its IUVENTUS_HW_QUEUES queues into contiguous halves per endpoint, so a
+	 * peer count is only bounded by the hardware queue count, not by the endpoint count. */
+	if (ctx->num_peers > IUVENTUS_HW_QUEUES) {
+		SPDK_ERRLOG("%u card queue(s) requested but the design has %u\n",
+			    ctx->num_peers, IUVENTUS_HW_QUEUES);
+		rc = -EINVAL;
+		goto eps_attach_fail;
 	}
 
 	bars_print(ctx);
@@ -967,9 +1246,12 @@ iuventus_init(struct iuventus_ctx *ctx, const struct iuventus_opts *opts)
 ctrl_fail:
 	queues_dealloc(ctx);
 queues_fail:
-	if (ctx->pci_dev != NULL) {
-		spdk_pci_device_detach(ctx->pci_dev);
-		ctx->pci_dev = NULL;
+eps_attach_fail:
+	while (attached_eps-- > 0) {
+		if (ctx->ep[attached_eps].pci_dev != NULL) {
+			spdk_pci_device_detach(ctx->ep[attached_eps].pci_dev);
+			ctx->ep[attached_eps].pci_dev = NULL;
+		}
 	}
 pci_attach_fail:
 	dma_dev_fini(ctx);
@@ -987,33 +1269,43 @@ probe_fail:
 int
 iuventus_enable(struct iuventus_ctx *ctx)
 {
+	/* Per-endpoint free-page register, indexed by ctx->ep[]: EP0 reuses the register the
+	 * single-endpoint card always had, EP1 is the mirrored block at REG_EP1_RD_PAGES_FREE. */
+	static const uint32_t rd_pages_free_reg[IUVENTUS_MAX_EPS] = {
+		REG_RD_PAGES_FREE, REG_EP1_RD_PAGES_FREE,
+	};
 	uint8_t *cqbuf;
 	uint32_t free_pages;
+	uint32_t e;
 	size_t i;
 
-	if (ctx == NULL || ctx->nfb_comp == NULL || ctx->cq.vaddr == NULL) {
+	if (ctx == NULL || ctx->nfb_comp == NULL || ctx->num_eps == 0 ||
+	    ctx->ep[0].cq.vaddr == NULL) {
 		SPDK_ERRLOG("environment is not initialised\n");
 		return -EINVAL;
 	}
 
-	/* Bounded by the BAR size rather than by a page count so that queues this run did not
-	 * create are cleared too; those are exactly the ones that carry stale entries. */
-	cqbuf = ctx->cq.vaddr;
-	for (i = 0; i < ctx->cq.size; i++) {
-		cqbuf[i] = 0;
-	}
+	for (e = 0; e < ctx->num_eps; e++) {
+		/* Bounded by the BAR size rather than by a page count so that queues this run did
+		 * not create are cleared too; those are exactly the ones that carry stale entries. */
+		cqbuf = ctx->ep[e].cq.vaddr;
+		for (i = 0; i < ctx->ep[e].cq.size; i++) {
+			cqbuf[i] = 0;
+		}
 
-	/* MANAGED_PAGES is duplicated from the card's iuventus_sizing_pkg, and nothing links the
-	 * two: if the card manages more pages than this list describes, it indexes past the
-	 * allocation and the drive fetches whatever follows in the hugepage -- silently, as wrong
-	 * data pointers rather than an error. Idle free pages is the card's own count, so a list
-	 * that cannot cover it is caught here instead of as corrupt traffic later. */
-	free_pages = nfb_comp_read32(ctx->nfb_comp, REG_RD_PAGES_FREE) & 0xFFFF;
-	if (free_pages > MANAGED_PAGES) {
-		SPDK_ERRLOG("card manages at least %u pages but this build's PRP list describes only "
-			    "%u; rebuild with MANAGED_PAGES matching iuventus_sizing_pkg.vhd\n",
-			    free_pages, MANAGED_PAGES);
-		return -EINVAL;
+		/* MANAGED_PAGES is duplicated from the card's iuventus_sizing_pkg, and nothing
+		 * links the two: if the card manages more pages than this list describes, it
+		 * indexes past the allocation and the drive fetches whatever follows in the
+		 * hugepage -- silently, as wrong data pointers rather than an error. Idle free
+		 * pages is the card's own count, so a list that cannot cover it is caught here
+		 * instead of as corrupt traffic later. */
+		free_pages = nfb_comp_read32(ctx->nfb_comp, rd_pages_free_reg[e]) & 0xFFFF;
+		if (free_pages > MANAGED_PAGES) {
+			SPDK_ERRLOG("endpoint %u manages at least %u pages but this build's PRP "
+				    "list describes only %u; rebuild with MANAGED_PAGES matching "
+				    "iuventus_sizing_pkg.vhd\n", e, free_pages, MANAGED_PAGES);
+			return -EINVAL;
+		}
 	}
 
 	nfb_comp_write16(ctx->nfb_comp, REG_CONTROL,
@@ -1063,6 +1355,7 @@ void
 iuventus_fini(struct iuventus_ctx *ctx)
 {
 	uint32_t q;
+	uint32_t e;
 
 	if (ctx == NULL) {
 		return;
@@ -1080,9 +1373,11 @@ iuventus_fini(struct iuventus_ctx *ctx)
 	dma_ctrl_deinit(ctx);
 	queues_dealloc(ctx);
 
-	if (ctx->pci_dev != NULL) {
-		spdk_pci_device_detach(ctx->pci_dev);
-		ctx->pci_dev = NULL;
+	for (e = 0; e < ctx->num_eps; e++) {
+		if (ctx->ep[e].pci_dev != NULL) {
+			spdk_pci_device_detach(ctx->ep[e].pci_dev);
+			ctx->ep[e].pci_dev = NULL;
+		}
 	}
 
 	dma_dev_fini(ctx);
@@ -1111,4 +1406,14 @@ iuventus_peer(const struct iuventus_ctx *ctx, uint32_t i)
 	}
 
 	return &ctx->peers[i];
+}
+
+uint32_t
+iuventus_queue_ep(const struct iuventus_ctx *ctx, uint32_t q)
+{
+	if (ctx == NULL || ctx->num_eps == 0 || ctx->num_peers == 0) {
+		return 0;
+	}
+
+	return q / (IUVENTUS_HW_QUEUES / ctx->num_eps);
 }

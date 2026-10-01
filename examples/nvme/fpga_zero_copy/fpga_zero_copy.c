@@ -983,6 +983,7 @@ rd_ctrl_regs(struct spdk_nvme_ctrlr *ctrlr)
 static void
 prp_list_dump(const struct iuventus_ctx *ctx, const char *path)
 {
+	uint32_t e;
 	uint32_t i;
 	FILE *f;
 
@@ -996,23 +997,26 @@ prp_list_dump(const struct iuventus_ctx *ctx, const char *path)
 		return;
 	}
 
-	fprintf(f, "Write PRP List (vaddr: %p, paddr: 0x%lx, entries: %u):\n",
-		ctx->wrbuff_prp_list.vaddr, ctx->wrbuff_prp_list.paddr,
-		ctx->wrbuff_prp_list.entries);
-	for (i = 0; i < ctx->wrbuff_prp_list.entries; i++) {
-		fprintf(f, "\tEntry %u: 0x%lx\n", i, ((uint64_t *)ctx->wrbuff_prp_list.vaddr)[i]);
-	}
+	for (e = 0; e < ctx->num_eps; e++) {
+		const struct iuventus_ep *ep = &ctx->ep[e];
 
-	fprintf(f, "Read PRP List (vaddr: %p, paddr: 0x%lx, entries: %u):\n",
-		ctx->rdbuff_prp_list.vaddr, ctx->rdbuff_prp_list.paddr,
-		ctx->rdbuff_prp_list.entries);
-	for (i = 0; i < ctx->rdbuff_prp_list.entries; i++) {
-		fprintf(f, "\tEntry %u: 0x%lx\n", i, ((uint64_t *)ctx->rdbuff_prp_list.vaddr)[i]);
+		fprintf(f, "Endpoint %u Write PRP List (vaddr: %p, paddr: 0x%lx, entries: %u):\n",
+			e, ep->wrbuff_prp_list.vaddr, ep->wrbuff_prp_list.paddr,
+			ep->wrbuff_prp_list.entries);
+		for (i = 0; i < ep->wrbuff_prp_list.entries; i++) {
+			fprintf(f, "\tEntry %u: 0x%lx\n", i, ((uint64_t *)ep->wrbuff_prp_list.vaddr)[i]);
+		}
+
+		fprintf(f, "Endpoint %u Read PRP List (vaddr: %p, paddr: 0x%lx, entries: %u):\n",
+			e, ep->rdbuff_prp_list.vaddr, ep->rdbuff_prp_list.paddr,
+			ep->rdbuff_prp_list.entries);
+		for (i = 0; i < ep->rdbuff_prp_list.entries; i++) {
+			fprintf(f, "\tEntry %u: 0x%lx\n", i, ((uint64_t *)ep->rdbuff_prp_list.vaddr)[i]);
+		}
 	}
 
 	fclose(f);
-	printf("PRP lists written to %s (%u entries each)\n", path,
-	       ctx->rdbuff_prp_list.entries);
+	printf("PRP lists written to %s (%u endpoint(s))\n", path, ctx->num_eps);
 }
 
 static void
