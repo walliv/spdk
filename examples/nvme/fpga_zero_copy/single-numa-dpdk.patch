@@ -1,0 +1,14 @@
+single-numa-dpdk.patch: build DPDK for one NUMA node, as every Iuventus host binary was built
+Apply inside the dpdk submodule before configuring SPDK: git -C dpdk apply ../examples/nvme/fpga_zero_copy/single-numa-dpdk.patch
+The test host runs one NUMA node; SPDK built with this setting since 2025-04-22.
+
+diff --git a/config/x86/meson.build b/config/x86/meson.build
+index 8087b9ae91..57e0d97050 100644
+--- a/config/x86/meson.build
++++ b/config/x86/meson.build
+@@ -108,4 +108,4 @@ else
+     endforeach
+ endif
+ 
+-dpdk_conf.set('RTE_MAX_NUMA_NODES', 32)
++dpdk_conf.set('RTE_MAX_NUMA_NODES', 1)
