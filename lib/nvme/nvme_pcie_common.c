@@ -52,8 +52,10 @@ nvme_pcie_qpair_reset(struct spdk_nvme_qpair *qpair)
 	 *  rolls over.
 	 */
 	pqpair->flags.phase = 1;
-	for (i = 0; i < pqpair->num_entries; i++) {
-		pqpair->cpl[i].status.p = 0;
+	if (!pqpair->flags.peer_owned_cq) {
+		for (i = 0; i < pqpair->num_entries; i++) {
+			pqpair->cpl[i].status.p = 0;
+		}
 	}
 
 	return 0;
@@ -140,8 +142,14 @@ nvme_pcie_qpair_construct(struct spdk_nvme_qpair *qpair,
 		pqpair->sq_vaddr = opts->sq.vaddr;
 		pqpair->cq_vaddr = opts->cq.vaddr;
 		pqpair->flags.disable_pcie_sgl_merge = opts->disable_pcie_sgl_merge;
+		pqpair->flags.peer_owned_cq = opts->peer_owned_cq;
 		sq_paddr = opts->sq.paddr;
 		cq_paddr = opts->cq.paddr;
+	}
+
+	if (pqpair->flags.peer_owned_cq && pqpair->cq_vaddr == NULL) {
+		SPDK_ERRLOG("A peer-owned completion queue needs user-supplied memory\n");
+		return -EINVAL;
 	}
 
 	pqpair->retry_count = ctrlr->opts.transport_retry_count;
@@ -1160,7 +1168,8 @@ nvme_pcie_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	/* Now that the submission queue is deleted, the device is supposed to have
 	 * completed any outstanding I/O. Try to complete them. If they don't complete,
 	 * they'll be marked as aborted and completed below. */
-	if (qpair->active_proc == nvme_ctrlr_get_current_process(ctrlr)) {
+	if (qpair->active_proc == nvme_ctrlr_get_current_process(ctrlr) &&
+	    !pqpair->flags.peer_owned_cq) {
 		nvme_pcie_qpair_process_completions(qpair, 0);
 	}
 

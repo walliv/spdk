@@ -216,6 +216,101 @@ test_nvme_pcie_qpair_construct_destroy(void)
 	MOCK_CLEAR(spdk_vtophys);
 }
 
+static struct nvme_pcie_qpair *
+ut_io_qpair_alloc(struct nvme_pcie_ctrlr *pctrlr)
+{
+	struct nvme_pcie_qpair *pqpair;
+
+	pqpair = spdk_zmalloc(sizeof(*pqpair), 64, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_SHARE);
+	SPDK_CU_ASSERT_FATAL(pqpair != NULL);
+	pqpair->qpair.ctrlr = &pctrlr->ctrlr;
+	pqpair->qpair.id = 1;
+	pqpair->num_entries = 2;
+
+	return pqpair;
+}
+
+/* Deletes a connected qpair whose user-supplied completion queue is cpl and returns how often
+ * the deletion polled that queue. */
+static uint64_t
+ut_delete_io_qpair_polls(struct nvme_pcie_ctrlr *pctrlr, struct spdk_nvme_cpl *cpl,
+			 bool peer_owned_cq)
+{
+	struct nvme_request req[2] = {};
+	struct spdk_nvme_pcie_stat stat = {};
+	struct nvme_pcie_qpair *pqpair;
+	int rc;
+
+	STAILQ_INIT(&pctrlr->ctrlr.adminq->free_req);
+	STAILQ_INSERT_HEAD(&pctrlr->ctrlr.adminq->free_req, &req[0], stailq);
+	STAILQ_INSERT_HEAD(&pctrlr->ctrlr.adminq->free_req, &req[1], stailq);
+
+	pqpair = ut_io_qpair_alloc(pctrlr);
+	pqpair->sq_vaddr = (void *)0xDCADBEEF;
+	pqpair->cq_vaddr = cpl;
+	pqpair->cpl = cpl;
+	pqpair->flags.peer_owned_cq = peer_owned_cq;
+	pqpair->flags.phase = 1;
+	pqpair->pcie_state = NVME_PCIE_QPAIR_READY;
+	pqpair->stat = &stat;
+	pqpair->shared_stats = true;
+	TAILQ_INIT(&pqpair->free_tr);
+	TAILQ_INIT(&pqpair->outstanding_tr);
+
+	rc = nvme_pcie_ctrlr_delete_io_qpair(&pctrlr->ctrlr, &pqpair->qpair);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(STAILQ_EMPTY(&pctrlr->ctrlr.adminq->free_req));
+
+	return stat.polls;
+}
+
+static void
+test_nvme_pcie_qpair_peer_owned_cq(void)
+{
+	struct spdk_nvme_io_qpair_opts opts = {};
+	struct nvme_pcie_ctrlr pctrlr = {};
+	struct spdk_nvme_qpair adminq = {};
+	struct spdk_nvme_cpl cpl[2] = {};
+	struct nvme_pcie_qpair *pqpair;
+	int rc;
+
+	pctrlr.ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
+	pctrlr.ctrlr.adminq = &adminq;
+	pctrlr.doorbell_base = (void *)0xF7000000;
+	pctrlr.doorbell_stride_u32 = 1;
+	opts.sq.vaddr = (void *)0xDCADBEEF;
+	opts.sq.paddr = 0xDEADBEEF;
+	opts.cq.paddr = 0xDBADBEEF;
+	opts.peer_owned_cq = true;
+
+	/* The caller clears a peer-owned queue, so it must supply that queue's memory. */
+	pqpair = ut_io_qpair_alloc(&pctrlr);
+	rc = nvme_pcie_qpair_construct(&pqpair->qpair, &opts);
+	CU_ASSERT(rc == -EINVAL);
+	nvme_pcie_qpair_destroy(&pqpair->qpair);
+
+	opts.cq.vaddr = cpl;
+	cpl[0].status.p = 1;
+	cpl[1].status.p = 1;
+	pqpair = ut_io_qpair_alloc(&pctrlr);
+	rc = nvme_pcie_qpair_construct(&pqpair->qpair, &opts);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(pqpair->flags.peer_owned_cq == 1);
+	CU_ASSERT(pqpair->flags.phase == 1);
+	CU_ASSERT(cpl[0].status.p == 1 && cpl[1].status.p == 1);
+	nvme_pcie_qpair_destroy(&pqpair->qpair);
+
+	opts.peer_owned_cq = false;
+	pqpair = ut_io_qpair_alloc(&pctrlr);
+	rc = nvme_pcie_qpair_construct(&pqpair->qpair, &opts);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(cpl[0].status.p == 0 && cpl[1].status.p == 0);
+	nvme_pcie_qpair_destroy(&pqpair->qpair);
+
+	CU_ASSERT(ut_delete_io_qpair_polls(&pctrlr, cpl, false) == 1);
+	CU_ASSERT(ut_delete_io_qpair_polls(&pctrlr, cpl, true) == 0);
+}
+
 static void
 test_nvme_pcie_ctrlr_cmd_create_delete_io_queue(void)
 {
@@ -589,6 +684,7 @@ main(int argc, char **argv)
 	suite = CU_add_suite("nvme_pcie_common", NULL, NULL);
 	CU_ADD_TEST(suite, test_nvme_pcie_ctrlr_alloc_cmb);
 	CU_ADD_TEST(suite, test_nvme_pcie_qpair_construct_destroy);
+	CU_ADD_TEST(suite, test_nvme_pcie_qpair_peer_owned_cq);
 	CU_ADD_TEST(suite, test_nvme_pcie_ctrlr_cmd_create_delete_io_queue);
 	CU_ADD_TEST(suite, test_nvme_pcie_ctrlr_connect_qpair);
 	CU_ADD_TEST(suite, test_nvme_pcie_ctrlr_construct_admin_qpair);

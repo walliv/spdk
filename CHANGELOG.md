@@ -38,6 +38,10 @@ fill it out which can be used by the application to register interrupts on the q
 
 Added `opts_size` in `spdk_nvme_io_qpair_opts` structure to align it with other opts structures.
 
+Added `peer_owned_cq` option to `spdk_nvme_io_qpair_opts`. It hands a user-supplied PCIe completion
+queue to a peer device, such as an FPGA issuing commands peer-to-peer: the driver neither clears the
+queue's phase tags on connect nor reaps it when the qpair is deleted.
+
 `spdk_nvme_poll_group_create()` now creates a fd group to manage interrupt events.
 
 Two new APIs have been added to manage interrupt events in poll group.

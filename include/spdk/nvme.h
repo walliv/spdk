@@ -1812,8 +1812,15 @@ struct spdk_nvme_io_qpair_opts {
 	 */
 	bool disable_pcie_sgl_merge;
 
-	/* Hole at bytes 67-71. */
-	uint8_t reserved67[5];
+	/**
+	 * This flag if set to true hands the user-supplied completion queue (cq.vaddr) to a peer
+	 * PCIe device: the driver never reads or writes it, so the caller clears it before every
+	 * connect and never submits on or polls this qpair.
+	 */
+	bool peer_owned_cq;
+
+	/* Hole at bytes 68-71. */
+	uint8_t reserved68[4];
 
 	/**
 	 * The size of spdk_nvme_io_qpair_opts according to the caller of this library is used for
