@@ -119,12 +119,6 @@ static struct spdk_pci_id ncd_ep1_pci_driver_id[] = {
 
 SPDK_PCI_DRIVER_REGISTER(ncd_ep1, ncd_ep1_pci_driver_id, SPDK_PCI_DRIVER_NEED_MAPPING)
 
-struct admin_cmd_ctx {
-	const char	*cmd_name;
-	bool		done;
-	int		status;
-};
-
 /* Index of the peer with this transport address, or -1. */
 static int
 peer_by_traddr(const struct iuventus_ctx *ctx, const char *traddr)
@@ -137,47 +131,6 @@ peer_by_traddr(const struct iuventus_ctx *ctx, const char *traddr)
 		}
 	}
 	return -1;
-}
-
-static void
-qop_complete_cb(void *cb_ctx, const struct spdk_nvme_cpl *cpl)
-{
-	struct admin_cmd_ctx *cmd_ctx = cb_ctx;
-
-	cmd_ctx->done = true;
-	if (spdk_nvme_cpl_is_error(cpl)) {
-		spdk_nvme_print_completion(0, (struct spdk_nvme_cpl *)cpl);
-		SPDK_ERRLOG("CPL error status: %s\n",
-			    spdk_nvme_cpl_get_status_string(&cpl->status));
-		SPDK_ERRLOG("%s failed, aborting run\n", cmd_ctx->cmd_name);
-		cmd_ctx->status = -1;
-	}
-}
-
-static int
-submit_admin_request_on(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
-			const char *cmd_name)
-{
-	int rc = 0;
-	struct admin_cmd_ctx cmd_ctx = {
-		.cmd_name = cmd_name,
-	};
-
-	rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, cmd, NULL, 0, qop_complete_cb, &cmd_ctx);
-	if (rc) {
-		SPDK_ERRLOG("Failed to submit the command %s!\n", cmd_ctx.cmd_name);
-		return -EIO;
-	}
-
-	while (!cmd_ctx.done) {
-		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
-	}
-
-	if (cmd_ctx.status != 0) {
-		return -EIO;
-	}
-
-	return 0;
 }
 
 static bool
@@ -311,50 +264,16 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 }
 
 static void
-queues_delete(struct iuventus_ctx *ctx)
-{
-	struct spdk_nvme_cmd cmd;
-	uint32_t q;
-
-	for (q = 0; q < ctx->num_peers; q++) {
-		struct iuventus_peer *peer = &ctx->peers[q];
-
-		if (peer->ctrlr == NULL) {
-			continue;
-		}
-		if (peer->sq_created) {
-			memset(&cmd, 0, sizeof(cmd));
-			cmd.opc = SPDK_NVME_OPC_DELETE_IO_SQ;
-			cmd.cdw10_bits.delete_io_q.qid = peer->hw_qid;
-			if (submit_admin_request_on(peer->ctrlr, &cmd, "SQ_DELETE")) {
-				SPDK_ERRLOG("Failed SQ_DELETE (q%u)!\n", q);
-			}
-			peer->sq_created = false;
-		}
-		if (peer->cq_created) {
-			memset(&cmd, 0, sizeof(cmd));
-			cmd.opc = SPDK_NVME_OPC_DELETE_IO_CQ;
-			cmd.cdw10_bits.delete_io_q.qid = peer->hw_qid;
-			if (submit_admin_request_on(peer->ctrlr, &cmd, "CQ_DELETE")) {
-				SPDK_ERRLOG("Failed CQ_DELETE (q%u)!\n", q);
-			}
-			peer->cq_created = false;
-		}
-	}
-}
-
-static void
 queues_dealloc(struct iuventus_ctx *ctx)
 {
 	uint32_t q;
 
-	queues_delete(ctx);
 	for (q = 0; q < ctx->num_peers; q++) {
 		struct iuventus_peer *peer = &ctx->peers[q];
 
-		if (peer->qid_alloc && peer->ctrlr != NULL) {
-			spdk_nvme_ctrlr_free_qid(peer->ctrlr, peer->hw_qid);
-			peer->qid_alloc = false;
+		if (peer->qpair != NULL) {
+			spdk_nvme_ctrlr_free_io_qpair(peer->qpair);
+			peer->qpair = NULL;
 			peer->hw_qid = -1;
 		}
 	}
@@ -368,7 +287,6 @@ static int
 queues_alloc(struct iuventus_ctx *ctx)
 {
 	struct spdk_nvme_io_qpair_opts qopts;
-	struct spdk_nvme_cmd cmd = {0};
 	uint32_t q;
 	int rc = 0;
 
@@ -383,6 +301,7 @@ queues_alloc(struct iuventus_ctx *ctx)
 		qopts.io_queue_requests = ctx->qsize;
 		qopts.io_queue_size = ctx->qsize;
 	}
+	qopts.peer_owned_cq = true;
 
 	for (q = 0; q < ctx->num_peers; q++) {
 		struct iuventus_peer *peer = &ctx->peers[q];
@@ -412,14 +331,14 @@ queues_alloc(struct iuventus_ctx *ctx)
 			cpl_buff[i] = 0;
 		}
 
-		qid = spdk_nvme_ctrlr_alloc_qid(peer->ctrlr);
-		if (qid < 0) {
-			SPDK_ERRLOG("Failed to allocate QID for card queue %u\n", q);
-			rc = -ENOSPC;
+		peer->qpair = spdk_nvme_ctrlr_alloc_io_qpair(peer->ctrlr, &qopts, sizeof(qopts));
+		if (peer->qpair == NULL) {
+			SPDK_ERRLOG("Failed to create the queue pair of card queue %u\n", q);
+			rc = -EIO;
 			goto fail;
 		}
+		qid = spdk_nvme_qpair_get_id(peer->qpair);
 		peer->hw_qid = qid;
-		peer->qid_alloc = true;
 		peer->sqtdbl_paddr = peer->doorbell_base +
 				     (2 * qid) * (4 << peer->doorbell_stride);
 		peer->cqhdbl_paddr = peer->doorbell_base +
@@ -428,36 +347,6 @@ queues_alloc(struct iuventus_ctx *ctx)
 			       peer->trid.traddr, qid, q);
 		SPDK_NOTICELOG("\tSQTDBL physical address: 0x%lx\n", peer->sqtdbl_paddr);
 		SPDK_NOTICELOG("\tCQHDBL physical address: 0x%lx\n", peer->cqhdbl_paddr);
-
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opc = SPDK_NVME_OPC_CREATE_IO_CQ;
-		cmd.nsid = 0;
-		cmd.cdw10_bits.create_io_q.qid = qid;
-		cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
-		cmd.cdw11_bits.create_io_cq.pc = 1;
-		cmd.dptr.prp.prp1 = cq_paddr;
-		rc = submit_admin_request_on(peer->ctrlr, &cmd, "CQ_CREATE");
-		if (rc) {
-			SPDK_ERRLOG("Failed CQ_CREATE (q%u)!\n", q);
-			goto fail;
-		}
-		peer->cq_created = true;
-
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opc = SPDK_NVME_OPC_CREATE_IO_SQ;
-		cmd.nsid = 0;
-		cmd.cdw10_bits.create_io_q.qid = qid;
-		cmd.cdw10_bits.create_io_q.qsize = qopts.io_queue_size - 1;
-		cmd.cdw11_bits.create_io_sq.pc = 1;
-		cmd.cdw11_bits.create_io_sq.qprio = 2;
-		cmd.cdw11_bits.create_io_sq.cqid = qid;
-		cmd.dptr.prp.prp1 = sq_paddr;
-		rc = submit_admin_request_on(peer->ctrlr, &cmd, "SQ_CREATE");
-		if (rc) {
-			SPDK_ERRLOG("Failed SQ_CREATE (q%u)!\n", q);
-			goto fail;
-		}
-		peer->sq_created = true;
 	}
 
 	SPDK_NOTICELOG("%u card queue(s) allocated, one per drive.\n", ctx->num_peers);

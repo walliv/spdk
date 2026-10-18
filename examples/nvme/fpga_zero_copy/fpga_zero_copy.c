@@ -38,9 +38,8 @@
  * through ublk as a regular Linux block device (/dev/ublkb<q> for
  * every drive q selected with -U).
  *
- * The FPGA uses its own queue pair (hw_qid, managed via raw
- * admin commands) while each host I/O channel owns its own
- * software queue pair,
+ * The FPGA drives its own peer-owned queue pair (hw_qid) while
+ * each host I/O channel owns its own software queue pair,
  * so no cross-device locking is required.
  * ============================================================
  */

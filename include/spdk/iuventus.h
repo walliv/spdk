@@ -94,15 +94,13 @@ struct iuventus_peer {
 	char				name[64];
 
 	/* Library bookkeeping. */
+	struct spdk_nvme_qpair		*qpair;
 	uint64_t			doorbell_base;
 	uint32_t			doorbell_stride;
 	uint16_t			doorbell_mask;
 	uint64_t			sqtdbl_paddr;
 	uint64_t			cqhdbl_paddr;
 	bool				attached;
-	bool				qid_alloc;
-	bool				cq_created;
-	bool				sq_created;
 };
 
 /** A mapped card BAR. */
