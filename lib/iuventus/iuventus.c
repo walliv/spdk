@@ -1198,6 +1198,23 @@ probe_fail:
 	return rc;
 }
 
+/* Bounded by the BAR size rather than by a page count so that queues this run did not create
+ * are cleared too; those are exactly the ones that carry stale entries. */
+static void
+cq_rings_clear(struct iuventus_ctx *ctx)
+{
+	uint8_t *cqbuf;
+	uint32_t e;
+	size_t i;
+
+	for (e = 0; e < ctx->num_eps; e++) {
+		cqbuf = ctx->ep[e].cq.vaddr;
+		for (i = 0; i < ctx->ep[e].cq.size; i++) {
+			cqbuf[i] = 0;
+		}
+	}
+}
+
 int
 iuventus_enable(struct iuventus_ctx *ctx)
 {
@@ -1206,10 +1223,8 @@ iuventus_enable(struct iuventus_ctx *ctx)
 	static const uint32_t rd_pages_free_reg[IUVENTUS_MAX_EPS] = {
 		REG_RD_PAGES_FREE, REG_EP1_RD_PAGES_FREE,
 	};
-	uint8_t *cqbuf;
 	uint32_t free_pages;
 	uint32_t e;
-	size_t i;
 
 	if (ctx == NULL || ctx->nfb_comp == NULL || ctx->num_eps == 0 ||
 	    ctx->ep[0].cq.vaddr == NULL) {
@@ -1217,14 +1232,8 @@ iuventus_enable(struct iuventus_ctx *ctx)
 		return -EINVAL;
 	}
 
+	cq_rings_clear(ctx);
 	for (e = 0; e < ctx->num_eps; e++) {
-		/* Bounded by the BAR size rather than by a page count so that queues this run did
-		 * not create are cleared too; those are exactly the ones that carry stale entries. */
-		cqbuf = ctx->ep[e].cq.vaddr;
-		for (i = 0; i < ctx->ep[e].cq.size; i++) {
-			cqbuf[i] = 0;
-		}
-
 		/* MANAGED_PAGES is duplicated from the card's iuventus_sizing_pkg, and nothing
 		 * links the two: if the card manages more pages than this list describes, it
 		 * indexes past the allocation and the drive fetches whatever follows in the
@@ -1281,6 +1290,112 @@ iuventus_drain(struct iuventus_ctx *ctx, uint32_t timeout_ms)
 	}
 
 	return 0;
+}
+
+static uint64_t
+ticks_to_us(uint64_t ticks)
+{
+	return ticks * 1000000 / spdk_get_ticks_hz();
+}
+
+/* Section 3.7.3: CC.EN 1->0, then CSTS.RDY 0 within CAP.TO, which deletes every I/O queue. */
+static int
+peer_reset_disable(struct iuventus_peer *peer)
+{
+	union spdk_nvme_cap_register cap = spdk_nvme_ctrlr_get_regs_cap(peer->ctrlr);
+	uint64_t bound = (cap.bits.to * 500 + 1000) * spdk_get_ticks_hz() / 1000;
+	uint64_t start = spdk_get_ticks();
+	int rc;
+
+	rc = spdk_nvme_ctrlr_disconnect(peer->ctrlr);
+	if (rc != 0) {
+		return rc;
+	}
+	while (spdk_nvme_ctrlr_process_admin_completions(peer->ctrlr) != -ENXIO) {
+		if (spdk_get_ticks() - start > bound) {
+			return -ETIMEDOUT;
+		}
+	}
+	peer->reset_disable_us = ticks_to_us(spdk_get_ticks() - start);
+	return 0;
+}
+
+/* Section 3.5.1 steps 5-11: CC.EN 1, CSTS.RDY 1, admin set-up, then each I/O CQ before its SQ. SPDK
+ * bounds every step by CAP.TO itself and re-creates the card's queue pair with the rest. */
+static int
+peer_reset_enable(struct iuventus_peer *peer)
+{
+	uint64_t start = spdk_get_ticks();
+	int rc;
+
+	spdk_nvme_ctrlr_reconnect_async(peer->ctrlr);
+	do {
+		rc = spdk_nvme_ctrlr_reconnect_poll_async(peer->ctrlr);
+	} while (rc == -EAGAIN);
+	if (rc != 0) {
+		return rc;
+	}
+	peer->reset_enable_us = ticks_to_us(spdk_get_ticks() - start);
+
+	/* The card rings the doorbells of this queue identifier, so it must survive the reset. */
+	if (spdk_nvme_qpair_get_id(peer->qpair) != peer->hw_qid) {
+		SPDK_ERRLOG("%s came back with qid %u instead of %d\n", peer->trid.traddr,
+			    spdk_nvme_qpair_get_id(peer->qpair), peer->hw_qid);
+		return -EIO;
+	}
+	return 0;
+}
+
+int
+iuventus_reset_peers(struct iuventus_ctx *ctx)
+{
+	bool was_enabled;
+	uint32_t q;
+	int rc;
+
+	if (ctx == NULL || ctx->nfb_comp == NULL) {
+		return -EINVAL;
+	}
+
+	/* The card restarts all of its queues at once, and the queues of a caller's drive are not
+	 * re-created here, so that drive would come back out of step with the card. */
+	for (q = 0; q < ctx->num_peers; q++) {
+		if (ctx->peers[q].caller_owned) {
+			SPDK_ERRLOG("%s belongs to the caller, which must reset it\n",
+				    ctx->peers[q].trid.traddr);
+			return -EPERM;
+		}
+	}
+
+	/* Section 3.7.2: no command may still be outstanding when CC.EN drops. */
+	was_enabled = ctx->enabled;
+	iuventus_disable(ctx);
+	rc = iuventus_drain(ctx, IUVENTUS_DRAIN_TIMEOUT_MS);
+	if (rc != 0) {
+		return rc;
+	}
+
+	for (q = 0; q < ctx->num_peers; q++) {
+		struct iuventus_peer *peer = &ctx->peers[q];
+
+		rc = peer_reset_disable(peer);
+		if (rc == 0) {
+			/* peer_owned_cq leaves clearing the ring before its re-creation to us. */
+			cq_rings_clear(ctx);
+			rc = peer_reset_enable(peer);
+		}
+		if (rc != 0) {
+			SPDK_ERRLOG("controller reset of %s failed: %d\n", peer->trid.traddr, rc);
+			return rc;
+		}
+		SPDK_NOTICELOG("%s reset: CSTS.RDY 0 after %" PRIu64 " us, queues back after %"
+			       PRIu64 " us\n", peer->trid.traddr, peer->reset_disable_us,
+			       peer->reset_enable_us);
+	}
+
+	/* The START of a re-enable is what rewinds every card queue to SQ tail 0, CQ head 0 and
+	 * phase 1, which is where the re-created queues begin. */
+	return was_enabled ? iuventus_enable(ctx) : 0;
 }
 
 void

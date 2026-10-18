@@ -92,6 +92,10 @@ struct iuventus_peer {
 	struct spdk_nvme_transport_id	trid;
 	/** Model name reported by the controller. */
 	char				name[64];
+	/** Last iuventus_reset_peers(): CC.EN 1->0 until CSTS.RDY 0, in microseconds. */
+	uint64_t			reset_disable_us;
+	/** Last iuventus_reset_peers(): CC.EN 0->1 until the card's queues exist again. */
+	uint64_t			reset_enable_us;
 
 	/* Library bookkeeping. */
 	struct spdk_nvme_qpair		*qpair;
@@ -325,6 +329,14 @@ void iuventus_disable(struct iuventus_ctx *ctx);
  * \return 0 once the design is idle, -ETIMEDOUT if it is still busy when the bound expires.
  */
 int iuventus_drain(struct iuventus_ctx *ctx, uint32_t timeout_ms);
+
+/**
+ * NVMe Controller Reset of every drive (Base 2.3 sections 3.7.2, 3.5.1): drain the card, CC.EN
+ * 1->0 until CSTS.RDY 0, let SPDK re-create the card's queue pairs, then restart the card.
+ *
+ * \return 0, -EPERM if the caller attached a drive, -ETIMEDOUT, or the failing reset's error.
+ */
+int iuventus_reset_peers(struct iuventus_ctx *ctx);
 
 /**
  * Tear down everything iuventus_init() brought up, in strict reverse order.
