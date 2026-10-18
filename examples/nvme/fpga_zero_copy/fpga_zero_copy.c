@@ -5,811 +5,28 @@
  *   Copyright (C) Vladislav Válek
  */
 
-#include <stdint.h>
-#include <stdlib.h>
-#include <sys/queue.h>
-#include <signal.h>
-#include <pthread.h>
-
 #include "spdk/stdinc.h"
 
-#include "spdk/nvme.h"
-#include "spdk/nvme_spec.h"
-#include "spdk/vmd.h"
+#include "spdk/bdev.h"
 #include "spdk/env.h"
-#include "spdk/string.h"
+#include "spdk/event.h"
+#include "spdk/iuventus.h"
+#include "spdk/json.h"
 #include "spdk/log.h"
 #include "spdk/memory.h"
-#include "spdk/accel.h"
-#include "spdk/bdev.h"
-#include "spdk/bdev_module.h"
+#include "spdk/nvme.h"
+#include "spdk/nvme_spec.h"
+#include "spdk/string.h"
 #include "spdk/thread.h"
-#include "spdk/ublk.h"
-#include "spdk/iuventus.h"
-#include "ublk_internal.h"
 
-/*
- * ============================================================
- * Host Filesystem Bdev Module
- *
- * This module wraps host-side NVMe software queue pairs as
- * an SPDK bdev so that the host can access the NVMe namespace
- * through the standard SPDK block-device layer and, from there,
- * through ublk as a regular Linux block device (/dev/ublkb<q> for
- * every drive q selected with -U).
- *
- * The FPGA drives its own peer-owned queue pair (hw_qid) while
- * each host I/O channel owns its own software queue pair,
- * so no cross-device locking is required.
- * ============================================================
- */
-
-/* Bdev name prefix; drive q's bdev is fpga_nvme_host<q> and its kernel disk /dev/ublkb<q>. */
-#define NVME_HOST_BDEV_PREFIX "fpga_nvme_host"
-/* Host I/O queue pair per drive: deeper than one ublk queue (128) so a full ublk queue fits. */
-#define NVME_HOST_QPAIR_SIZE  256
-/* Upper bound on any one host-fs control step; a step that misses it is reported, not waited on. */
-#define HOST_FS_STEP_TIMEOUT_MS 15000
-
-/* Opaque per-bdev context. */
-struct nvme_host_bdev {
-	struct spdk_bdev        bdev;
-	struct spdk_nvme_ns    *ns;
-};
-
-/* Per-I/O-channel context: one poller drives NVMe completions. */
-struct nvme_host_io_channel {
-	struct nvme_host_bdev *bdev_ctx;
-	struct spdk_nvme_qpair *qpair;
-	struct spdk_poller    *poller;
-};
-
-/*
- * SGL iterator state used by readv/writev path.
- * Stored per submitted bdev_io and freed in completion callback.
- */
-struct nvme_host_sgl_ctx {
-	struct spdk_bdev_io *bdev_io;
-	struct iovec        *iovs;
-	int                  iovcnt;
-	int                  iovpos;
-	uint32_t             iov_offset;
-};
-
-/* Forward declarations. */
-static int  nvme_host_module_init(void);
-static void nvme_host_bdev_submit_request(struct spdk_io_channel *ch,
-					  struct spdk_bdev_io *bdev_io);
-static void nvme_host_read_get_buf_cb(struct spdk_io_channel *ch,
-				      struct spdk_bdev_io *bdev_io,
-				      bool success);
-static bool nvme_host_bdev_io_type_supported(void *ctx,
-					     enum spdk_bdev_io_type io_type);
-static struct spdk_io_channel *nvme_host_bdev_get_io_channel(void *ctx);
-static int  nvme_host_bdev_destruct(void *ctx);
-
-static struct spdk_bdev_module g_nvme_host_module = {
-	.name        = "nvme_host",
-	.module_init = nvme_host_module_init,
-};
-
-SPDK_BDEV_MODULE_REGISTER(nvme_host, &g_nvme_host_module)
-
-static int
-nvme_host_module_init(void)
-{
-	return 0;
-}
-
-/* Called when an NVMe read/write command issued through the bdev layer completes. */
-static void
-nvme_host_io_cb(void *cb_arg, const struct spdk_nvme_cpl *cpl)
-{
-	struct spdk_bdev_io *bdev_io = cb_arg;
-
-	spdk_bdev_io_complete(bdev_io,
-			      spdk_nvme_cpl_is_error(cpl)
-			      ? SPDK_BDEV_IO_STATUS_FAILED
-			      : SPDK_BDEV_IO_STATUS_SUCCESS);
-}
-
-static void
-nvme_host_sgl_reset(void *cb_arg, uint32_t offset)
-{
-	struct nvme_host_sgl_ctx *sgl_ctx = cb_arg;
-	struct iovec *iov;
-
-	/* Position iterator to the SGL element containing byte offset. */
-	sgl_ctx->iov_offset = offset;
-	for (sgl_ctx->iovpos = 0; sgl_ctx->iovpos < sgl_ctx->iovcnt; sgl_ctx->iovpos++) {
-		iov = &sgl_ctx->iovs[sgl_ctx->iovpos];
-		if (sgl_ctx->iov_offset < iov->iov_len) {
-			break;
-		}
-
-		sgl_ctx->iov_offset -= iov->iov_len;
-	}
-}
-
-static int
-nvme_host_sgl_next(void *cb_arg, void **address, uint32_t *length)
-{
-	struct nvme_host_sgl_ctx *sgl_ctx = cb_arg;
-	struct iovec *iov;
-
-	/* Signal malformed request if iterator is out of bounds. */
-	if (sgl_ctx->iovpos >= sgl_ctx->iovcnt) {
-		return -EINVAL;
-	}
-
-	/* Return current segment and apply intra-segment offset if needed. */
-	iov = &sgl_ctx->iovs[sgl_ctx->iovpos];
-	*address = iov->iov_base;
-	*length = iov->iov_len;
-
-	if (sgl_ctx->iov_offset) {
-		if (sgl_ctx->iov_offset > iov->iov_len) {
-			return -EINVAL;
-		}
-		*address += sgl_ctx->iov_offset;
-		*length -= sgl_ctx->iov_offset;
-	}
-
-	sgl_ctx->iov_offset += *length;
-	if (sgl_ctx->iov_offset == iov->iov_len) {
-		sgl_ctx->iovpos++;
-		sgl_ctx->iov_offset = 0;
-	}
-
-	/* Continue until all segments are consumed. */
-	return 0;
-}
-
-static void
-nvme_host_io_sgl_cb(void *cb_arg, const struct spdk_nvme_cpl *cpl)
-{
-	struct nvme_host_sgl_ctx *sgl_ctx = cb_arg;
-	struct spdk_bdev_io *bdev_io = sgl_ctx->bdev_io;
-
-	/* SGL context lifetime ends when NVMe command completes. */
-	free(sgl_ctx);
-
-	spdk_bdev_io_complete(bdev_io,
-			      spdk_nvme_cpl_is_error(cpl)
-			      ? SPDK_BDEV_IO_STATUS_FAILED
-			      : SPDK_BDEV_IO_STATUS_SUCCESS);
-}
-
-static void
-nvme_host_read_get_buf_cb(struct spdk_io_channel *ch,
-			  struct spdk_bdev_io *bdev_io,
-			  bool success)
-{
-	if (!success) {
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		return;
-	}
-
-	nvme_host_bdev_submit_request(ch, bdev_io);
-}
-
-static void
-nvme_host_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
-{
-	struct nvme_host_io_channel *host_ch = spdk_io_channel_get_ctx(ch);
-	struct nvme_host_bdev *bdev_ctx = host_ch->bdev_ctx;
-	struct nvme_host_sgl_ctx *sgl_ctx = NULL;
-	int rc = 0;
-
-	switch (bdev_io->type) {
-	case SPDK_BDEV_IO_TYPE_READ:
-		/* Acquire a data buffer for requests that arrived without iovecs. */
-		if (bdev_io->u.bdev.iovcnt <= 0) {
-			spdk_bdev_io_get_buf(bdev_io, nvme_host_read_get_buf_cb,
-					     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
-			return;
-		}
-
-		if (bdev_io->u.bdev.iovcnt == 1) {
-			/* Fast path for contiguous payload. */
-			rc = spdk_nvme_ns_cmd_read(bdev_ctx->ns, host_ch->qpair,
-						   bdev_io->u.bdev.iovs[0].iov_base,
-						   bdev_io->u.bdev.offset_blocks,
-						   bdev_io->u.bdev.num_blocks,
-						   nvme_host_io_cb, bdev_io, 0);
-		} else {
-			/* Multi-iov path uses readv + SGL callbacks. */
-			sgl_ctx = calloc(1, sizeof(*sgl_ctx));
-			if (sgl_ctx == NULL) {
-				rc = -ENOMEM;
-				break;
-			}
-
-			/* Capture request scatter-gather array for callback iteration. */
-			sgl_ctx->bdev_io = bdev_io;
-			sgl_ctx->iovs = bdev_io->u.bdev.iovs;
-			sgl_ctx->iovcnt = bdev_io->u.bdev.iovcnt;
-
-			rc = spdk_nvme_ns_cmd_readv(bdev_ctx->ns, host_ch->qpair,
-						    bdev_io->u.bdev.offset_blocks,
-						    bdev_io->u.bdev.num_blocks,
-						    nvme_host_io_sgl_cb, sgl_ctx, 0,
-						    nvme_host_sgl_reset, nvme_host_sgl_next);
-		}
-		break;
-	case SPDK_BDEV_IO_TYPE_WRITE:
-		/* Defensive guard: bdev request must contain at least one iovec. */
-		if (bdev_io->u.bdev.iovcnt <= 0) {
-			rc = -EINVAL;
-			break;
-		}
-
-		if (bdev_io->u.bdev.iovcnt == 1) {
-			/* Fast path for contiguous payload. */
-			rc = spdk_nvme_ns_cmd_write(bdev_ctx->ns, host_ch->qpair,
-						    bdev_io->u.bdev.iovs[0].iov_base,
-						    bdev_io->u.bdev.offset_blocks,
-						    bdev_io->u.bdev.num_blocks,
-						    nvme_host_io_cb, bdev_io, 0);
-		} else {
-			/* Multi-iov path uses writev + SGL callbacks. */
-			sgl_ctx = calloc(1, sizeof(*sgl_ctx));
-			if (sgl_ctx == NULL) {
-				rc = -ENOMEM;
-				break;
-			}
-
-			/* Capture request scatter-gather array for callback iteration. */
-			sgl_ctx->bdev_io = bdev_io;
-			sgl_ctx->iovs = bdev_io->u.bdev.iovs;
-			sgl_ctx->iovcnt = bdev_io->u.bdev.iovcnt;
-
-			rc = spdk_nvme_ns_cmd_writev(bdev_ctx->ns, host_ch->qpair,
-						     bdev_io->u.bdev.offset_blocks,
-						     bdev_io->u.bdev.num_blocks,
-						     nvme_host_io_sgl_cb, sgl_ctx, 0,
-						     nvme_host_sgl_reset, nvme_host_sgl_next);
-		}
-		break;
-	case SPDK_BDEV_IO_TYPE_FLUSH:
-		rc = spdk_nvme_ns_cmd_flush(bdev_ctx->ns, host_ch->qpair,
-						nvme_host_io_cb, bdev_io);
-		break;
-
-	default:
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-		return;
-	}
-
-	if (rc == -ENOMEM) {
-		if (sgl_ctx != NULL) {
-			free(sgl_ctx);
-		}
-
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
-		return;
-	}
-
-	if (rc) {
-		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
-	}
-
-	if (rc && sgl_ctx != NULL) {
-		/* Submission failed before completion callback could own the context. */
-		free(sgl_ctx);
-	}
-}
-
-static bool
-nvme_host_bdev_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
-{
-	switch (io_type) {
-	case SPDK_BDEV_IO_TYPE_READ:
-	case SPDK_BDEV_IO_TYPE_WRITE:
-	case SPDK_BDEV_IO_TYPE_FLUSH:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static struct spdk_io_channel *
-nvme_host_bdev_get_io_channel(void *ctx)
-{
-	return spdk_get_io_channel(ctx);
-}
-
-static int
-nvme_host_bdev_destruct(void *ctx)
-{
-	struct nvme_host_bdev *bdev_ctx = ctx;
-
-	spdk_io_device_unregister(bdev_ctx, NULL);
-	free(bdev_ctx->bdev.name);
-	free(bdev_ctx);
-	return 0;
-}
-
-/* Poller: drains the host SW queue pair's completion queue. */
-static int
-nvme_host_io_poll(void *arg)
-{
-	struct nvme_host_io_channel *ch = arg;
-	int32_t completions;
-
-	completions = spdk_nvme_qpair_process_completions(ch->qpair, 0);
-	return completions > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
-}
-
-static int
-nvme_host_create_ch(void *io_device, void *ctx_buf)
-{
-	struct nvme_host_bdev *bdev_ctx = io_device;
-	struct nvme_host_io_channel *ch = ctx_buf;
-
-	struct spdk_nvme_ctrlr *ctrlr = spdk_nvme_ns_get_ctrlr(bdev_ctx->ns);
-	struct spdk_nvme_io_qpair_opts qopts;
-
-	/* Explicit size: the controller default is the card's -q depth, shallower than a ublk queue. */
-	spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &qopts, sizeof(qopts));
-	qopts.io_queue_size     = NVME_HOST_QPAIR_SIZE;
-	qopts.io_queue_requests = NVME_HOST_QPAIR_SIZE;
-
-	ch->bdev_ctx = bdev_ctx;
-	ch->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &qopts, sizeof(qopts));
-	if (ch->qpair == NULL) {
-		return -ENOMEM;
-	}
-
-	ch->poller = SPDK_POLLER_REGISTER(nvme_host_io_poll, ch, 0);
-	if (ch->poller == NULL) {
-		spdk_nvme_ctrlr_free_io_qpair(ch->qpair);
-		ch->qpair = NULL;
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-
-static void
-nvme_host_destroy_ch(void *io_device, void *ctx_buf)
-{
-	struct nvme_host_io_channel *ch = ctx_buf;
-
-	spdk_poller_unregister(&ch->poller);
-	if (ch->qpair != NULL) {
-		spdk_nvme_ctrlr_free_io_qpair(ch->qpair);
-		ch->qpair = NULL;
-	}
-}
-
-static const struct spdk_bdev_fn_table g_nvme_host_fn_table = {
-	.destruct          = nvme_host_bdev_destruct,
-	.submit_request    = nvme_host_bdev_submit_request,
-	.io_type_supported = nvme_host_bdev_io_type_supported,
-	.get_io_channel    = nvme_host_bdev_get_io_channel,
-};
-
-static struct nvme_host_bdev *g_nvme_host_bdev[IUVENTUS_MAX_PEERS];
-static bool                   g_ublk_started[IUVENTUS_MAX_PEERS];
-static struct spdk_thread    *g_host_thread = NULL;
-/* How far host_fs_lib_init() got, so host_fs_fini() undoes exactly that much. */
-enum host_fs_stage { HOST_FS_NONE, HOST_FS_ACCEL, HOST_FS_IOBUF, HOST_FS_BDEV, HOST_FS_UBLK };
-static enum host_fs_stage     g_host_fs_stage = HOST_FS_NONE;
-
-/*
- * Thread registry: ublk_create_target() spawns one SPDK thread per
- * requested CPU core.  We collect them all here so that the main loop
- * can drive every thread without the reactor framework.
- *
- * 64 is far larger than any practical CPU count; if the limit is ever
- * hit a warning is emitted so the value can be adjusted.
- */
-#define HOST_FS_MAX_THREADS 64
-static struct spdk_thread *g_all_threads[HOST_FS_MAX_THREADS];
-static int                 g_num_threads = 0;
-
-/*
- * SPDK thread-library operation callback: called whenever a new SPDK
- * thread is created (e.g. by ublk_create_target).  We register the
- * thread so the main loop can poll it.
- */
-static int
-host_thread_op_fn(struct spdk_thread *thread)
-{
-	if (g_num_threads < HOST_FS_MAX_THREADS) {
-		g_all_threads[g_num_threads++] = thread;
-		return 0;
-	} else {
-		fprintf(stderr, "WARNING: HOST_FS_MAX_THREADS (%d) exceeded; "
-			"new SPDK thread will not be polled by the main loop.\n",
-			HOST_FS_MAX_THREADS);
-		return -1;
-	}
-	return 0;
-}
-
-static void
-host_thread_exit_msg(void *cb_arg)
-{
-	spdk_thread_exit(spdk_get_thread());
-}
-
-/* Poll every tracked SPDK thread once; returns non-zero when any of them did work. */
-static int
-host_fs_poll_all(void)
-{
-	int busy = 0;
-	int i;
-
-	for (i = 0; i < g_num_threads; i++) {
-		if (g_all_threads[i] != NULL && spdk_thread_poll(g_all_threads[i], 0, 0) > 0) {
-			busy = 1;
-		}
-	}
-	return busy;
-}
-
-static uint64_t
-host_fs_now_ms(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-/* Polls every tracked thread until *done is set or the step deadline passes (-ETIMEDOUT). */
-static int
-host_fs_wait(volatile bool *done, const char *what)
-{
-	uint64_t deadline = host_fs_now_ms() + HOST_FS_STEP_TIMEOUT_MS;
-
-	while (!*done) {
-		host_fs_poll_all();
-		if (host_fs_now_ms() > deadline) {
-			fprintf(stderr, "ERROR: host fs: '%s' did not finish within %d ms\n",
-				what, HOST_FS_STEP_TIMEOUT_MS);
-			return -ETIMEDOUT;
-		}
-	}
-	return 0;
-}
-
-/*
- * Register a thin bdev backed by the host SW queue pair so that the
- * NVMe namespace can be exposed as a standard Linux block device.
- */
-static int
-nvme_host_bdev_create(uint32_t q, const char *name, struct spdk_nvme_ns *ns)
-{
-	struct nvme_host_bdev *bdev_ctx;
-	int rc;
-
-	bdev_ctx = calloc(1, sizeof(*bdev_ctx));
-	if (!bdev_ctx) {
-		return -ENOMEM;
-	}
-
-	bdev_ctx->ns = ns;
-
-	bdev_ctx->bdev.ctxt         = bdev_ctx;
-	bdev_ctx->bdev.name         = strdup(name);
-	bdev_ctx->bdev.product_name = "FPGA NVMe Host Bdev";
-	bdev_ctx->bdev.fn_table     = &g_nvme_host_fn_table;
-	bdev_ctx->bdev.module       = &g_nvme_host_module;
-	bdev_ctx->bdev.write_cache  = 1;
-	bdev_ctx->bdev.blocklen     = spdk_nvme_ns_get_sector_size(ns);
-	bdev_ctx->bdev.blockcnt     = spdk_nvme_ns_get_num_sectors(ns);
-
-	spdk_io_device_register(bdev_ctx,
-				nvme_host_create_ch, nvme_host_destroy_ch,
-				sizeof(struct nvme_host_io_channel),
-				name);
-
-	rc = spdk_bdev_register(&bdev_ctx->bdev);
-	if (rc) {
-		spdk_io_device_unregister(bdev_ctx, NULL);
-		free(bdev_ctx->bdev.name);
-		free(bdev_ctx);
-		return rc;
-	}
-
-	g_nvme_host_bdev[q] = bdev_ctx;
-	return 0;
-}
-
-/* Callbacks used while initialising / finalising the bdev subsystem. */
-struct host_fs_sync_ctx {
-	int           rc;
-	volatile bool done;
-	uint32_t      id;
-};
-
-static void
-bdev_init_done_cb(void *cb_arg, int rc)
-{
-	struct host_fs_sync_ctx *ctx = cb_arg;
-
-	ctx->rc   = rc;
-	ctx->done = true;
-}
-
-static void
-bdev_fini_done_cb(void *cb_arg)
-{
-	struct host_fs_sync_ctx *ctx = cb_arg;
-
-	ctx->done = true;
-}
-
-/* Called once ublk_start_disk() reports success or failure. */
-static void
-ublk_start_cb(void *cb_arg, int result)
-{
-	struct host_fs_sync_ctx *ctx = cb_arg;
-
-	ctx->rc   = result;
-	ctx->done = true;
-
-	if (result) {
-		fprintf(stderr, "ERROR: Failed to start ublk disk (id=%u): %d\n", ctx->id, result);
-	} else {
-		printf("Host filesystem bdev %s%u registered as: /dev/ublkb%u\n",
-		       NVME_HOST_BDEV_PREFIX, ctx->id, ctx->id);
-	}
-	fflush(stdout);
-}
-
-/* Called once ublk_stop_disk() completes. */
-static void
-ublk_stop_cb(void *cb_arg, int result)
-{
-	struct host_fs_sync_ctx *ctx = cb_arg;
-
-	ctx->rc   = result;
-	ctx->done = true;
-}
-
-static void host_fs_fini(void);
-
-/*
- * Start the host-filesystem libraries once, before any drive is added:
- *  1. The SPDK thread library (with a thread-tracking hook so that the
- *     extra threads spawned by ublk_create_target are polled by the main loop).
- *  2. accel, iobuf and the bdev subsystem.
- *  3. The ublk target. Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK.
- *
- * Returns 0 on success, negative errno on failure (everything started is undone).
- */
-static int
-host_fs_lib_init(void)
-{
-	struct host_fs_sync_ctx ctx = {0};
-	int rc;
-
-	rc = spdk_thread_lib_init(host_thread_op_fn, 0);
-	if (rc) {
-		fprintf(stderr, "ERROR: spdk_thread_lib_init() failed: %d\n", rc);
-		return rc;
-	}
-
-	/* Create the primary host-filesystem SPDK thread (the app thread ublk control runs on). */
-	g_host_thread = spdk_thread_create("host_fs", NULL);
-	if (!g_host_thread) {
-		fprintf(stderr, "ERROR: Failed to create host_fs SPDK thread\n");
-		spdk_thread_lib_fini();
-		return -ENOMEM;
-	}
-	spdk_set_thread(g_host_thread);
-
-	/*
-	 * The bdev layer acquires an accel I/O channel for each bdev channel.
-	 * When this standalone example bypasses the normal SPDK app startup
-	 * path, the accel framework must be initialized explicitly.
-	 */
-	rc = spdk_accel_initialize();
-	if (rc) {
-		fprintf(stderr, "ERROR: spdk_accel_initialize() failed: %d\n", rc);
-		goto fail;
-	}
-	g_host_fs_stage = HOST_FS_ACCEL;
-
-	/* Both the bdev I/O-channel layer and the ublk driver need the iobuf pool. */
-	rc = spdk_iobuf_initialize();
-	if (rc) {
-		fprintf(stderr, "ERROR: spdk_iobuf_initialize() failed: %d\n", rc);
-		goto fail;
-	}
-	g_host_fs_stage = HOST_FS_IOBUF;
-
-	/* Initialise the bdev subsystem; our custom module_init() is a no-op. */
-	spdk_bdev_initialize(bdev_init_done_cb, &ctx);
-	rc = host_fs_wait(&ctx.done, "bdev initialize");
-	if (rc == 0 && ctx.rc) {
-		fprintf(stderr, "ERROR: spdk_bdev_initialize() failed: %d\n", ctx.rc);
-		rc = ctx.rc;
-	}
-	if (rc) {
-		goto fail;
-	}
-	g_host_fs_stage = HOST_FS_BDEV;
-
-	/*
-	 * ublk uses io_uring for the kernel<->user path and spawns one poll-group
-	 * thread per CPU in the mask; those are captured by host_thread_op_fn()
-	 * and polled by the main loop. One CPU (core 0) keeps the thread count
-	 * small in this non-reactor environment.
-	 */
-	spdk_ublk_init();
-	rc = ublk_create_target("0x1", NULL);
-	if (rc) {
-		fprintf(stderr, "ERROR: ublk_create_target() failed: %d\n", rc);
-		goto fail;
-	}
-	g_host_fs_stage = HOST_FS_UBLK;
-
-	return 0;
-
-fail:
-	host_fs_fini();
-	return rc;
-}
-
-/* Expose drive q's namespace through its own bdev and ublk disk /dev/ublkb<q>. */
-static int
-host_fs_add(uint32_t q, struct spdk_nvme_ns *ns)
-{
-	struct host_fs_sync_ctx ctx = {0};
-	char name[32];
-	int rc;
-
-	snprintf(name, sizeof(name), "%s%u", NVME_HOST_BDEV_PREFIX, q);
-	rc = nvme_host_bdev_create(q, name, ns);
-	if (rc) {
-		fprintf(stderr, "ERROR: nvme_host_bdev_create(%s) failed: %d\n", name, rc);
-		return rc;
-	}
-
-	ctx.id = q;
-	rc = ublk_start_disk(name, q, UBLK_DEV_NUM_QUEUE, UBLK_DEV_QUEUE_DEPTH,
-			     ublk_start_cb, &ctx);
-	if (rc) {
-		fprintf(stderr, "ERROR: ublk_start_disk(%s) failed: %d\n", name, rc);
-		return rc;
-	}
-	rc = host_fs_wait(&ctx.done, "ublk start disk");
-	if (rc) {
-		return rc;
-	}
-	if (ctx.rc) {
-		return ctx.rc;
-	}
-	g_ublk_started[q] = true;
-	return 0;
-}
-
-/*
- * Tear down the host filesystem path in reverse initialisation order. Safe on a partial
- * bring-up; a step that misses its deadline is reported and the teardown carries on.
- */
-static void
-host_fs_fini(void)
-{
-	struct host_fs_sync_ctx ctx;
-	uint64_t deadline;
-	uint32_t q;
-	int i;
-
-	if (!g_host_thread) {
-		return;
-	}
-	spdk_set_thread(g_host_thread);
-
-	/* Stop every ublk disk first, then destroy the target. */
-	for (q = 0; q < IUVENTUS_MAX_PEERS; q++) {
-		if (!g_ublk_started[q]) {
-			continue;
-		}
-		ctx = (struct host_fs_sync_ctx){0};
-		if (ublk_stop_disk(q, ublk_stop_cb, &ctx) == 0) {
-			if (host_fs_wait(&ctx.done, "ublk stop disk") == 0) {
-				printf("/dev/ublkb%u stopped (%d)\n", q, ctx.rc);
-			}
-		}
-		g_ublk_started[q] = false;
-	}
-
-	/* Destroy the ublk target (tears down io_uring rings and threads). */
-	if (g_host_fs_stage >= HOST_FS_UBLK) {
-		ctx = (struct host_fs_sync_ctx){0};
-		if (ublk_destroy_target(bdev_fini_done_cb, &ctx) == 0) {
-			host_fs_wait(&ctx.done, "ublk destroy target");
-		}
-	}
-
-	/* Finalise the bdev subsystem (unregisters all bdevs). */
-	if (g_host_fs_stage >= HOST_FS_BDEV) {
-		ctx = (struct host_fs_sync_ctx){0};
-		spdk_bdev_finish(bdev_fini_done_cb, &ctx);
-		host_fs_wait(&ctx.done, "bdev finish");
-		memset(g_nvme_host_bdev, 0, sizeof(g_nvme_host_bdev));
-	}
-
-	if (g_host_fs_stage >= HOST_FS_IOBUF) {
-		ctx = (struct host_fs_sync_ctx){0};
-		spdk_iobuf_finish(bdev_fini_done_cb, &ctx);
-		host_fs_wait(&ctx.done, "iobuf finish");
-	}
-
-	/* Finalise accel after all bdev channels have been torn down. */
-	if (g_host_fs_stage >= HOST_FS_ACCEL) {
-		ctx = (struct host_fs_sync_ctx){0};
-		spdk_accel_finish(bdev_fini_done_cb, &ctx);
-		host_fs_wait(&ctx.done, "accel finish");
-	}
-	g_host_fs_stage = HOST_FS_NONE;
-
-	/*
-	 * ublk_destroy_target() already requests shutdown of ublk worker
-	 * threads on their own SPDK threads.  Only the current thread may call
-	 * spdk_thread_exit() directly, so request exit for any remaining
-	 * non-host threads via a message and destroy them only after they have
-	 * actually exited. A thread that does not exit in time is leaked, not waited on.
-	 */
-	for (i = 0; i < g_num_threads; i++) {
-		if (g_all_threads[i] != NULL && g_all_threads[i] != g_host_thread &&
-		    !spdk_thread_is_exited(g_all_threads[i])) {
-			spdk_thread_send_msg(g_all_threads[i], host_thread_exit_msg, NULL);
-		}
-	}
-
-	deadline = host_fs_now_ms() + HOST_FS_STEP_TIMEOUT_MS;
-	for (i = 0; i < g_num_threads; i++) {
-		if (g_all_threads[i] == NULL || g_all_threads[i] == g_host_thread) {
-			continue;
-		}
-
-		while (!spdk_thread_is_exited(g_all_threads[i]) && host_fs_now_ms() <= deadline) {
-			spdk_thread_poll(g_all_threads[i], 0, 0);
-		}
-		if (!spdk_thread_is_exited(g_all_threads[i])) {
-			fprintf(stderr, "ERROR: host fs: thread %s did not exit, leaking it\n",
-				spdk_thread_get_name(g_all_threads[i]));
-			g_all_threads[i] = NULL;
-			continue;
-		}
-		spdk_thread_destroy(g_all_threads[i]);
-		g_all_threads[i] = NULL;
-	}
-
-	spdk_thread_exit(g_host_thread);
-	deadline = host_fs_now_ms() + HOST_FS_STEP_TIMEOUT_MS;
-	while (!spdk_thread_is_exited(g_host_thread) && host_fs_now_ms() <= deadline) {
-		spdk_thread_poll(g_host_thread, 0, 0);
-	}
-	if (!spdk_thread_is_exited(g_host_thread)) {
-		/* spdk_thread_lib_fini() would assert on a live thread, so stop here. */
-		fprintf(stderr, "ERROR: host fs: host_fs thread did not exit; skipping lib fini\n");
-		g_host_thread = NULL;
-		g_num_threads = 0;
-		return;
-	}
-	spdk_thread_destroy(g_host_thread);
-
-	g_host_thread = NULL;
-	g_num_threads = 0;
-
-	spdk_thread_lib_fini();
-	printf("Host filesystem path torn down\n");
-}
-
-/* ============================================================
- * End of Host Filesystem Bdev Module
- * ============================================================ */
-
-/* Set from the signal handler; the main loop and the admin-poll threads watch it. */
-static volatile int             stop = 0;
+/* Run scripts find fzc by this process name. */
+#define APP_NAME "fpga_zero_copy"
+/* bdev_nvme names drive q's controller <prefix><q> and its namespace bdev <prefix><q>n1. */
+#define HOST_CTRLR_PREFIX "fpga_nvme_host"
+/* Admin queues of the drives the library attached are polled at this period. */
+#define ADMIN_POLL_PERIOD_US 1000
+
+/* SIGUSR1 asks for the drives' log pages; the admin poller serves the request. */
 static volatile sig_atomic_t    g_dumpreq = 0;
 
 /* -r / -s: which reset to issue, whether it was reached, and how it went. */
@@ -820,24 +37,21 @@ static bool                     g_do_subs_rst = false;
 static bool                     g_reset_issued = false;
 static int                      g_reset_rc = 0;
 
-/* Env options are filled in from the option callback, so they live here rather than in main(). */
-static struct spdk_env_opts     g_env_opts;
-
-/* One admin-poll thread per drive. */
-static pthread_t                g_poll_thread[IUVENTUS_MAX_PEERS];
-static bool                     g_thread_started[IUVENTUS_MAX_PEERS];
+/* App options are filled in from the option callback, so they live here rather than in main(). */
+static struct spdk_app_opts     g_app_opts;
 
 /* -U: drives (bit q = queue q's drive) whose namespace is also exposed to the host via ublk. */
 static uint32_t                 g_host_fs_mask = 0;
 
+static struct iuventus_opts     g_iu_opts;
+static struct iuventus_ctx      g_iu_ctx;
+static bool                     g_iu_up = false;
+static struct spdk_poller      *g_admin_poller = NULL;
+
 static void
 sig_usr(int signo)
 {
-	if (signo == SIGINT || signo == SIGTERM) {
-		stop = 1;
-	} else if (signo == SIGUSR1) {
-		g_dumpreq = 1;
-	}
+	g_dumpreq = 1;
 }
 
 /* Log NVMe Asynchronous Event Notifications as they arrive (wedge diagnostics). */
@@ -1066,7 +280,7 @@ usage(void)
 	printf("\t[-r do a controller reset (i.e. soft reset)]\n");
 	printf("\t[-P file to dump the PRP lists into]\n");
 	printf("\t[-U peer mask: bit q exposes queue q's drive to the host as /dev/ublkb<q> through\n");
-	printf("\t     its own host queue pair next to the card's (default 0 = none)]\n");
+	printf("\t     bdev_nvme, next to the card's queue pair (default 0 = none)]\n");
 	printf("\t     Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK (modprobe ublk_drv).\n");
 }
 
@@ -1101,18 +315,18 @@ app_parse(int ch, char *arg)
 		break;
 	}
 	case 'i':
-		g_env_opts.shm_id = spdk_strtol(arg, 10);
-		if (g_env_opts.shm_id < 0) {
+		g_app_opts.shm_id = spdk_strtol(arg, 10);
+		if (g_app_opts.shm_id < 0) {
 			fprintf(stderr, "Invalid shared memory ID\n");
 			return -1;
 		}
 		break;
 	case 'g':
-		g_env_opts.hugepage_single_segments = true;
+		g_app_opts.hugepage_single_segments = true;
 		break;
 	case 'm':
-		g_env_opts.mem_size = spdk_strtol(arg, 10);
-		if (g_env_opts.mem_size < 0) {
+		g_app_opts.mem_size = spdk_strtol(arg, 10);
+		if (g_app_opts.mem_size < 0) {
 			fprintf(stderr, "Invalid DPDK memory size\n");
 			return -1;
 		}
@@ -1163,188 +377,295 @@ reset_peers_cb(struct iuventus_ctx *ctx, void *cb_arg)
 }
 
 /*
- * The data plane runs on the card, so this only services admin completions and asynchronous
- * events. One thread per drive means a drive that stops answering cannot hold up the others.
+ * The data plane runs on the card, so the host only services admin completions and asynchronous
+ * events of the drives the library attached; bdev_nvme polls the admin queues of its own.
  */
-static void *
-drive_poll_fn(void *arg)
+static int
+admin_poll(void *arg)
 {
-	struct spdk_nvme_ctrlr *ctrlr = arg;
+	uint32_t i;
 
-	while (!stop) {
-		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
-		usleep(1000);
+	for (i = 0; i < iuventus_num_peers(&g_iu_ctx); i++) {
+		const struct iuventus_peer *peer = iuventus_peer(&g_iu_ctx, i);
+
+		if (!peer->caller_owned) {
+			spdk_nvme_ctrlr_process_admin_completions(peer->ctrlr);
+		}
 	}
-	return NULL;
+	if (g_dumpreq) {
+		g_dumpreq = 0;
+		for (i = 0; i < iuventus_num_peers(&g_iu_ctx); i++) {
+			const struct iuventus_peer *peer = iuventus_peer(&g_iu_ctx, i);
+
+			printf("--- drive %u (%s) ---\n", i, peer->trid.traddr);
+			dump_nvme_logs(peer->ctrlr, "POST-WEDGE");
+		}
+	}
+	return SPDK_POLLER_IDLE;
+}
+
+/* Growing, NUL-terminated buffer the JSON writer emits into. */
+struct json_buf {
+	char	*data;
+	size_t	len;
+};
+
+static int
+json_buf_write(void *cb_ctx, const void *data, size_t size)
+{
+	struct json_buf *buf = cb_ctx;
+	char *grown = realloc(buf->data, buf->len + size + 1);
+
+	if (grown == NULL) {
+		return -ENOMEM;
+	}
+	memcpy(grown + buf->len, data, size);
+	buf->len += size;
+	grown[buf->len] = '\0';
+	buf->data = grown;
+	return 0;
+}
+
+static void
+json_method_begin(struct spdk_json_write_ctx *w, const char *method)
+{
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", method);
+	spdk_json_write_named_object_begin(w, "params");
+}
+
+static void
+json_method_end(struct spdk_json_write_ctx *w)
+{
+	spdk_json_write_object_end(w);
+	spdk_json_write_object_end(w);
+}
+
+/* JSON config that attaches every -U drive through bdev_nvme and exports its namespace via ublk. */
+static char *
+host_fs_config(void)
+{
+	struct json_buf buf = {};
+	struct spdk_json_write_ctx *w;
+	char name[32];
+	uint32_t q;
+
+	w = spdk_json_write_begin(json_buf_write, &buf, 0);
+	if (w == NULL) {
+		return NULL;
+	}
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_array_begin(w, "subsystems");
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "subsystem", "bdev");
+	spdk_json_write_named_array_begin(w, "config");
+	for (q = 0; q < g_iu_opts.num_peers; q++) {
+		if (g_host_fs_mask & (1U << q)) {
+			snprintf(name, sizeof(name), "%s%u", HOST_CTRLR_PREFIX, q);
+			json_method_begin(w, "bdev_nvme_attach_controller");
+			spdk_json_write_named_string(w, "name", name);
+			spdk_json_write_named_string(w, "trtype", "PCIe");
+			spdk_json_write_named_string(w, "traddr", g_iu_opts.peer_trid[q].traddr);
+			json_method_end(w);
+		}
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "subsystem", "ublk");
+	spdk_json_write_named_array_begin(w, "config");
+	json_method_begin(w, "ublk_create_target");
+	spdk_json_write_named_string(w, "cpumask", "0x1");
+	json_method_end(w);
+	for (q = 0; q < g_iu_opts.num_peers; q++) {
+		if (g_host_fs_mask & (1U << q)) {
+			snprintf(name, sizeof(name), "%s%un1", HOST_CTRLR_PREFIX, q);
+			json_method_begin(w, "ublk_start_disk");
+			spdk_json_write_named_string(w, "bdev_name", name);
+			spdk_json_write_named_uint32(w, "ublk_id", q);
+			json_method_end(w);
+		}
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+	if (spdk_json_write_end(w) != 0) {
+		free(buf.data);
+		return NULL;
+	}
+	return buf.data;
+}
+
+static void
+host_bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
+{
+}
+
+/* Controller bdev_nvme attached for drive q, or NULL when its namespace bdev is missing. */
+static struct spdk_nvme_ctrlr *
+host_fs_ctrlr(uint32_t q)
+{
+	struct spdk_bdev_desc *desc;
+	struct spdk_nvme_ns *ns = NULL;
+	char name[32];
+
+	snprintf(name, sizeof(name), "%s%un1", HOST_CTRLR_PREFIX, q);
+	if (spdk_bdev_open_ext(name, false, host_bdev_event_cb, NULL, &desc) != 0) {
+		return NULL;
+	}
+	if (strcmp(spdk_bdev_get_module_name(spdk_bdev_desc_get_bdev(desc)), "nvme") == 0) {
+		ns = spdk_bdev_get_module_ctx(desc);
+	}
+	spdk_bdev_close(desc);
+
+	return ns != NULL ? spdk_nvme_ns_get_ctrlr(ns) : NULL;
+}
+
+/* SIGINT/SIGTERM land here through the app framework: stop the card before its drives go away. */
+static void
+fzc_shutdown(void)
+{
+	uint32_t i;
+
+	spdk_poller_unregister(&g_admin_poller);
+	if (g_iu_up) {
+		iuventus_disable(&g_iu_ctx);
+		if (iuventus_drain(&g_iu_ctx, IUVENTUS_DRAIN_TIMEOUT_MS)) {
+			fprintf(stderr, "WARNING: tearing down a design that has not gone idle\n");
+		}
+		for (i = 0; i < iuventus_num_peers(&g_iu_ctx); i++) {
+			rd_ctrl_regs(iuventus_peer(&g_iu_ctx, i)->ctrlr);
+		}
+		iuventus_fini(&g_iu_ctx);
+		g_iu_up = false;
+		printf("DMA Iuventus environment torn down\n");
+	}
+	spdk_app_stop(0);
+}
+
+/* Runs once the subsystems are up and, with -U, bdev_nvme and ublk hold the selected drives. */
+static void
+fzc_start(void *arg)
+{
+	uint32_t i;
+	int rc;
+
+	/* The reactor renamed the main thread, which carries the process name. */
+	pthread_setname_np(pthread_self(), APP_NAME);
+
+	for (i = 0; i < g_iu_opts.num_peers; i++) {
+		if (!(g_host_fs_mask & (1U << i))) {
+			continue;
+		}
+		g_iu_opts.peer_ctrlr[i] = host_fs_ctrlr(i);
+		if (g_iu_opts.peer_ctrlr[i] == NULL) {
+			fprintf(stderr, "bdev_nvme holds no controller for drive %u (%s)\n", i,
+				g_iu_opts.peer_trid[i].traddr);
+			spdk_app_stop(-ENODEV);
+			return;
+		}
+		printf("Host filesystem bdev %s%un1 registered as: /dev/ublkb%u\n",
+		       HOST_CTRLR_PREFIX, i, i);
+	}
+
+	if (g_do_ctrl_rst || g_do_subs_rst) {
+		g_iu_opts.on_peers_ready = reset_peers_cb;
+	}
+
+	rc = iuventus_init(&g_iu_ctx, &g_iu_opts);
+	if (g_reset_issued) {
+		/* The hook stopped the bring-up on purpose once the reset had been issued, so the
+		 * reset's own result is what this run reports. */
+		spdk_app_stop(g_reset_rc);
+		return;
+	}
+	if (rc) {
+		fprintf(stderr, "Unable to bring up the DMA Iuventus environment: %d\n", rc);
+		spdk_app_stop(rc);
+		return;
+	}
+	g_iu_up = true;
+
+	for (i = 0; i < iuventus_num_peers(&g_iu_ctx); i++) {
+		const struct iuventus_peer *peer = iuventus_peer(&g_iu_ctx, i);
+
+		printf("--- drive %u (%s) ---\n", i, peer->trid.traddr);
+		/* bdev_nvme owns the event callback of the drives it attached. */
+		if (!peer->caller_owned) {
+			spdk_nvme_ctrlr_register_aer_callback(peer->ctrlr, aer_cb, NULL);
+		}
+		rd_ctrl_regs(peer->ctrlr);
+		force_active_power_state(peer->ctrlr);
+		dump_nvme_logs(peer->ctrlr, "BASELINE");
+	}
+
+	prp_list_dump(&g_iu_ctx, g_prp_dump_path);
+
+	rc = iuventus_enable(&g_iu_ctx);
+	if (rc) {
+		fprintf(stderr, "Unable to enable the card: %d\n", rc);
+		iuventus_fini(&g_iu_ctx);
+		g_iu_up = false;
+		spdk_app_stop(rc);
+		return;
+	}
+
+	g_admin_poller = SPDK_POLLER_REGISTER(admin_poll, NULL, ADMIN_POLL_PERIOD_US);
+	signal(SIGUSR1, sig_usr);
+
+	printf("Initialization complete. Starting main loop.\n");
+	fflush(stdout);
 }
 
 int
 main(int argc, char **argv)
 {
-	struct iuventus_opts iu_opts;
-	struct iuventus_ctx iu_ctx = {0};
-	uint32_t i;
+	char *json = NULL;
 	int rc;
 
-	g_env_opts.opts_size = sizeof(g_env_opts);
-	spdk_env_opts_init(&g_env_opts);
-	g_env_opts.name = "fpga_zero_copy";
+	spdk_app_opts_init(&g_app_opts, sizeof(g_app_opts));
+	g_app_opts.name = APP_NAME;
+	g_app_opts.shutdown_cb = fzc_shutdown;
 
-	iuventus_opts_init(&iu_opts, sizeof(iu_opts));
+	iuventus_opts_init(&g_iu_opts, sizeof(g_iu_opts));
 
-	rc = iuventus_parse_args(argc, argv, &iu_opts, APP_GETOPT_STRING, app_parse, usage);
+	rc = iuventus_parse_args(argc, argv, &g_iu_opts, APP_GETOPT_STRING, app_parse, usage);
 	if (rc == IUVENTUS_PARSE_ARGS_HELP) {
 		return EXIT_SUCCESS;
 	}
 	if (rc != IUVENTUS_PARSE_ARGS_SUCCESS) {
 		return EXIT_FAILURE;
 	}
-	if (g_host_fs_mask >> iu_opts.num_peers) {
+	if (g_host_fs_mask >> g_iu_opts.num_peers) {
 		fprintf(stderr, "-U 0x%x names a drive past the %u given with -t\n",
-			g_host_fs_mask, iu_opts.num_peers);
+			g_host_fs_mask, g_iu_opts.num_peers);
+		return EXIT_FAILURE;
+	}
+	if (g_host_fs_mask != 0 && (g_do_ctrl_rst || g_do_subs_rst)) {
+		fprintf(stderr, "-U cannot be combined with -r or -s: bdev_nvme would lose its drive\n");
 		return EXIT_FAILURE;
 	}
 
-	if (spdk_env_init(&g_env_opts) < 0) {
-		fprintf(stderr, "Unable to initialize SPDK env\n");
-		return -1;
-	}
-
-	if (g_do_ctrl_rst || g_do_subs_rst) {
-		iu_opts.on_peers_ready = reset_peers_cb;
-	}
-
-	rc = iuventus_init(&iu_ctx, &iu_opts);
-	if (g_reset_issued) {
-		/* The hook stopped the bring-up on purpose once the reset had been issued, so the
-		 * reset's own result is what this run reports. A bring-up that failed before the
-		 * hook ran falls through to the check below instead. */
-		rc = g_reset_rc;
-		goto env_fini;
-	}
-	if (rc) {
-		fprintf(stderr, "Unable to bring up the DMA Iuventus environment: %d\n", rc);
-		goto env_fini;
-	}
-
-	for (i = 0; i < iuventus_num_peers(&iu_ctx); i++) {
-		const struct iuventus_peer *peer = iuventus_peer(&iu_ctx, i);
-
-		printf("--- drive %u (%s) ---\n", i, peer->trid.traddr);
-		spdk_nvme_ctrlr_register_aer_callback(peer->ctrlr, aer_cb, NULL);
-		rd_ctrl_regs(peer->ctrlr);
-		force_active_power_state(peer->ctrlr);
-		dump_nvme_logs(peer->ctrlr, "BASELINE");
-	}
-
-	prp_list_dump(&iu_ctx, g_prp_dump_path);
-
-	/*
-	 * Host-side filesystem path (-U): every selected drive gets a thin bdev backed by its own
-	 * host software queue pair, exposed via ublk as /dev/ublkb<q>. The card keeps its own
-	 * queue pair on the same drive, so the two paths need no synchronisation here.
-	 */
 	if (g_host_fs_mask != 0) {
-		rc = host_fs_lib_init();
-		for (i = 0; rc == 0 && i < iuventus_num_peers(&iu_ctx); i++) {
-			if (g_host_fs_mask & (1U << i)) {
-				rc = host_fs_add(i, iuventus_peer(&iu_ctx, i)->ns);
-			}
+		json = host_fs_config();
+		if (json == NULL) {
+			fprintf(stderr, "Unable to build the host filesystem configuration\n");
+			return EXIT_FAILURE;
 		}
-		if (rc) {
-			fprintf(stderr, "Warning: host filesystem (ublk) initialisation failed (%d).\n"
-				"The FPGA path will continue to operate normally.\n", rc);
-			/* Non-fatal: proceed without the host filesystem. */
-			host_fs_fini();
-			rc = 0;
-		}
+		g_app_opts.json_data = json;
+		g_app_opts.json_data_size = strlen(json);
 	}
+	/* Without -U only timed pollers run, so the reactor may sleep between them. bdev_nvme gets no
+	 * interrupts from a drive on uio_pci_generic, so -U keeps the reactor polling. */
+	g_app_opts.interrupt_mode = (g_host_fs_mask == 0);
 
-	rc = iuventus_enable(&iu_ctx);
-	if (rc) {
-		fprintf(stderr, "Unable to enable the card: %d\n", rc);
-		goto teardown;
-	}
-
-	for (i = 0; i < iuventus_num_peers(&iu_ctx); i++) {
-		const struct iuventus_peer *peer = iuventus_peer(&iu_ctx, i);
-
-		if (pthread_create(&g_poll_thread[i], NULL, drive_poll_fn, peer->ctrlr) != 0) {
-			fprintf(stderr, "WARNING: could not start poll thread for %s; its admin "
-				"queue will be polled by the main loop instead\n",
-				peer->trid.traddr);
-			continue;
-		}
-		g_thread_started[i] = true;
-	}
-
-	signal(SIGINT, sig_usr);
-	signal(SIGTERM, sig_usr);
-	signal(SIGUSR1, sig_usr);
-
-	printf("Initialization complete. Starting main loop.\n");
-
-	usleep(1000);
-
-	/*
-	 * Main loop: poll every tracked SPDK thread so that ublk requests
-	 * are processed and NVMe completions on the SW queue pair are
-	 * returned to the kernel in a timely fashion.
-	 * The card operates independently through its own hardware queue pair.
-	 *
-	 * ublk_create_target() creates one poll-group thread per requested
-	 * CPU core; all of them are tracked in g_all_threads[].
-	 */
-	while (!stop) {
-		int busy = host_fs_poll_all();
-
-		/* Drives whose poll thread could not start are serviced here. */
-		for (i = 0; i < iuventus_num_peers(&iu_ctx); i++) {
-			if (!g_thread_started[i]) {
-				spdk_nvme_ctrlr_process_admin_completions(
-					iuventus_peer(&iu_ctx, i)->ctrlr);
-			}
-		}
-		if (g_dumpreq) {
-			g_dumpreq = 0;
-			for (i = 0; i < iuventus_num_peers(&iu_ctx); i++) {
-				const struct iuventus_peer *peer = iuventus_peer(&iu_ctx, i);
-
-				printf("--- drive %u (%s) ---\n", i, peer->trid.traddr);
-				dump_nvme_logs(peer->ctrlr, "POST-WEDGE");
-			}
-		}
-		/* Back off only while every poller is idle; a short nap keeps host I/O latency low. */
-		if (!busy) {
-			usleep(g_num_threads > 0 ? 50 : 1000);
-		}
-	}
-
-	/* Stop the pollers before touching any controller from this thread again. */
-	for (i = 0; i < iuventus_num_peers(&iu_ctx); i++) {
-		if (g_thread_started[i]) {
-			pthread_join(g_poll_thread[i], NULL);
-			g_thread_started[i] = false;
-		}
-	}
-
-	iuventus_disable(&iu_ctx);
-	if (iuventus_drain(&iu_ctx, IUVENTUS_DRAIN_TIMEOUT_MS)) {
-		fprintf(stderr, "WARNING: tearing down a design that has not gone idle\n");
-	}
-
-	/* Tear down the host filesystem before any lower-level cleanup. */
-	host_fs_fini();
-
-	for (i = 0; i < iuventus_num_peers(&iu_ctx); i++) {
-		rd_ctrl_regs(iuventus_peer(&iu_ctx, i)->ctrlr);
-	}
-
-teardown:
-	iuventus_fini(&iu_ctx);
-	printf("DMA Iuventus environment torn down\n");
-env_fini:
-	spdk_env_fini();
+	rc = spdk_app_start(&g_app_opts, fzc_start, NULL);
+	spdk_app_fini();
+	free(json);
 	printf("Env finished\n");
 	return rc;
 }
