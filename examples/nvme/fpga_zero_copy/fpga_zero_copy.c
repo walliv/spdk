@@ -16,6 +16,7 @@
 #include "spdk/memory.h"
 #include "spdk/nvme.h"
 #include "spdk/nvme_spec.h"
+#include "spdk/rpc.h"
 #include "spdk/string.h"
 #include "spdk/thread.h"
 
@@ -524,6 +525,51 @@ host_fs_ctrlr(uint32_t q)
 
 	return ns != NULL ? spdk_nvme_ns_get_ctrlr(ns) : NULL;
 }
+
+/* Resets every drive's controller in the order NVMe Base 2.3 lays out; see iuventus_reset_peers(). */
+static void
+rpc_iuventus_reset_controllers(struct spdk_jsonrpc_request *request,
+			       const struct spdk_json_val *params)
+{
+	struct spdk_json_write_ctx *w;
+	uint32_t i;
+	int rc;
+
+	if (params != NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "iuventus_reset_controllers takes no parameters");
+		return;
+	}
+	if (!g_iu_up) {
+		spdk_jsonrpc_send_error_response(request, -ENODEV, "the card is not up");
+		return;
+	}
+
+	rc = iuventus_reset_peers(&g_iu_ctx);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, rc, "controller reset failed: %s",
+						     spdk_strerror(-rc));
+		return;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_array_begin(w);
+	for (i = 0; i < iuventus_num_peers(&g_iu_ctx); i++) {
+		const struct iuventus_peer *peer = iuventus_peer(&g_iu_ctx, i);
+		union spdk_nvme_cap_register cap = spdk_nvme_ctrlr_get_regs_cap(peer->ctrlr);
+
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string(w, "traddr", peer->trid.traddr);
+		spdk_json_write_named_int32(w, "qid", peer->hw_qid);
+		spdk_json_write_named_uint32(w, "cap_to_ms", cap.bits.to * 500);
+		spdk_json_write_named_uint64(w, "disable_us", peer->reset_disable_us);
+		spdk_json_write_named_uint64(w, "enable_us", peer->reset_enable_us);
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+SPDK_RPC_REGISTER("iuventus_reset_controllers", rpc_iuventus_reset_controllers, SPDK_RPC_RUNTIME)
 
 /* SIGINT/SIGTERM land here through the app framework: stop the card before its drives go away. */
 static void
