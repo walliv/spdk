@@ -165,6 +165,9 @@ struct nvme_pcie_qpair {
 
 		/* Disable merging of physically contiguous SGL entries */
 		uint8_t disable_pcie_sgl_merge	: 1;
+
+		/* A peer device consumes the completion queue, so the host never touches it */
+		uint8_t peer_owned_cq		: 1;
 	} flags;
 
 	/*
