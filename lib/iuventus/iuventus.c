@@ -58,6 +58,9 @@
 _Static_assert(MANAGED_PAGES % PRP_LIST_ENTRIES_PER_PAGE == 0,
 	       "MANAGED_PAGES must be a multiple of the entries one PRP list page holds, or the "
 	       "card's reserved pages do not line up with the list page boundaries");
+/* True when a caller built against an older, shorter iuventus_opts still carries field. */
+#define OPTS_HAS(opts, field) \
+	(offsetof(struct iuventus_opts, field) + sizeof((opts)->field) <= (opts)->opts_size)
 /* PER-QUEUE 2D block: queue q's registers at PER_Q_BASE + q*PER_Q_STRIDE + field offset. */
 #define PER_Q_BASE              0x200
 #define PER_Q_STRIDE            0x040
@@ -138,6 +141,11 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
 {
 	struct iuventus_ctx *ctx = cb_ctx;
+	int idx = peer_by_traddr(ctx, trid->traddr);
+
+	if (idx < 0 || ctx->peers[idx].caller_owned) {
+		return false;
+	}
 
 	SPDK_NOTICELOG("Probing %s ...\n", trid->traddr);
 
@@ -150,7 +158,7 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	opts->arb_mechanism = SPDK_NVME_CC_AMS_RR;
 	opts->enable_interrupts = false;
 
-	return peer_by_traddr(ctx, trid->traddr) >= 0;
+	return true;
 }
 
 static void
@@ -261,6 +269,20 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	peer->doorbell_stride = cap.bits.dstrd;
 	peer->nsid = nsid;
 	SPDK_NOTICELOG("Doorbell stride: %d\n", peer->doorbell_stride);
+}
+
+/* Detaches every controller the library attached itself; the caller detaches its own. */
+static void
+peers_detach(struct iuventus_ctx *ctx)
+{
+	uint32_t q;
+
+	for (q = 0; q < ctx->num_peers; q++) {
+		if (ctx->peers[q].ctrlr != NULL && !ctx->peers[q].caller_owned) {
+			spdk_nvme_detach(ctx->peers[q].ctrlr);
+		}
+		ctx->peers[q].ctrlr = NULL;
+	}
 }
 
 static void
@@ -987,6 +1009,7 @@ iuventus_init(struct iuventus_ctx *ctx, const struct iuventus_opts *opts)
 	struct ep_attach_ctx ep_actx;
 	bool ep1_found;
 	uint32_t attached_eps = 0;
+	uint32_t to_probe = 0;
 	uint32_t q;
 	int rc;
 
@@ -1014,18 +1037,43 @@ iuventus_init(struct iuventus_ctx *ctx, const struct iuventus_opts *opts)
 	for (q = 0; q < ctx->num_peers; q++) {
 		ctx->peers[q].trid = opts->peer_trid[q];
 		ctx->peers[q].hw_qid = -1;
+		if (OPTS_HAS(opts, peer_ctrlr) && opts->peer_ctrlr[q] != NULL) {
+			ctx->peers[q].caller_owned = true;
+		} else {
+			to_probe++;
+		}
 	}
 
 	SPDK_NOTICELOG("Initializing %u NVMe controller(s):\n", ctx->num_peers);
 	for (q = 0; q < ctx->num_peers; q++) {
-		SPDK_NOTICELOG("\tcard queue %u -> %s\n", q, ctx->peers[q].trid.traddr);
+		SPDK_NOTICELOG("\tcard queue %u -> %s%s\n", q, ctx->peers[q].trid.traddr,
+			       ctx->peers[q].caller_owned ? " (attached by the caller)" : "");
 	}
 
-	rc = spdk_nvme_probe(NULL, ctx, probe_cb, attach_cb, NULL);
-	if (rc != 0) {
-		SPDK_ERRLOG("spdk_nvme_probe() failed\n");
-		rc = -ENODEV;
-		goto probe_fail;
+	for (q = 0; q < ctx->num_peers; q++) {
+		struct spdk_nvme_ctrlr *ctrlr;
+
+		if (!ctx->peers[q].caller_owned) {
+			continue;
+		}
+		ctrlr = opts->peer_ctrlr[q];
+		if (spdk_nvme_transport_id_compare(spdk_nvme_ctrlr_get_transport_id(ctrlr),
+						   &ctx->peers[q].trid) != 0) {
+			SPDK_ERRLOG("the controller given for card queue %u is not %s\n", q,
+				    ctx->peers[q].trid.traddr);
+			rc = -EINVAL;
+			goto probe_fail;
+		}
+		attach_cb(ctx, &ctx->peers[q].trid, ctrlr, spdk_nvme_ctrlr_get_opts(ctrlr));
+	}
+
+	if (to_probe > 0) {
+		rc = spdk_nvme_probe(NULL, ctx, probe_cb, attach_cb, NULL);
+		if (rc != 0) {
+			SPDK_ERRLOG("spdk_nvme_probe() failed\n");
+			rc = -ENODEV;
+			goto probe_fail;
+		}
 	}
 
 	for (q = 0; q < ctx->num_peers; q++) {
@@ -1145,12 +1193,7 @@ eps_attach_fail:
 pci_attach_fail:
 	dma_dev_fini(ctx);
 probe_fail:
-	for (q = 0; q < ctx->num_peers; q++) {
-		if (ctx->peers[q].ctrlr != NULL) {
-			spdk_nvme_detach(ctx->peers[q].ctrlr);
-			ctx->peers[q].ctrlr = NULL;
-		}
-	}
+	peers_detach(ctx);
 	memset(ctx, 0, sizeof(*ctx));
 	return rc;
 }
@@ -1243,7 +1286,6 @@ iuventus_drain(struct iuventus_ctx *ctx, uint32_t timeout_ms)
 void
 iuventus_fini(struct iuventus_ctx *ctx)
 {
-	uint32_t q;
 	uint32_t e;
 
 	if (ctx == NULL) {
@@ -1271,12 +1313,7 @@ iuventus_fini(struct iuventus_ctx *ctx)
 
 	dma_dev_fini(ctx);
 
-	for (q = 0; q < ctx->num_peers; q++) {
-		if (ctx->peers[q].ctrlr != NULL) {
-			spdk_nvme_detach(ctx->peers[q].ctrlr);
-			ctx->peers[q].ctrlr = NULL;
-		}
-	}
+	peers_detach(ctx);
 
 	memset(ctx, 0, sizeof(*ctx));
 }

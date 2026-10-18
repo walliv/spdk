@@ -101,6 +101,8 @@ struct iuventus_peer {
 	uint64_t			sqtdbl_paddr;
 	uint64_t			cqhdbl_paddr;
 	bool				attached;
+	/* Attached by the caller through iuventus_opts::peer_ctrlr, which also detaches it. */
+	bool				caller_owned;
 };
 
 /** A mapped card BAR. */
@@ -179,6 +181,12 @@ struct iuventus_opts {
 	int		(*on_peers_ready)(struct iuventus_ctx *ctx, void *cb_arg);
 	/** Passed to on_peers_ready(). */
 	void		*cb_arg;
+	/**
+	 * Controller the caller has already attached for peer q, e.g. through bdev_nvme, or NULL
+	 * to have the library attach peer_trid[q]. Such a controller must match peer_trid[q], and
+	 * the library leaves detaching it to the caller.
+	 */
+	struct spdk_nvme_ctrlr	*peer_ctrlr[IUVENTUS_MAX_PEERS];
 };
 
 /**
@@ -257,10 +265,10 @@ int iuventus_parse_args(int argc, char **argv, struct iuventus_opts *opts,
 /**
  * Bring up the card and the drives bound to it.
  *
- * Attaches every peer, runs opts->on_peers_ready(), maps the card BARs, creates one NVMe I/O
- * queue pair per peer with its rings inside those BARs, allocates and publishes the data-pool
- * PRP lists, and programs the per-queue registers. The engine is left disabled; call
- * iuventus_enable() to start it.
+ * Attaches every peer not in opts->peer_ctrlr[], runs opts->on_peers_ready(), maps the card
+ * BARs, creates one NVMe I/O queue pair per peer with its rings inside those BARs, allocates and
+ * publishes the data-pool PRP lists, and programs the per-queue registers. The engine is left
+ * disabled; call iuventus_enable() to start it.
  *
  * Must be called after spdk_env_init(). On failure everything already brought up is unwound, so
  * the handle is left as good as untouched.
