@@ -461,6 +461,11 @@ host_fs_config(void)
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w, "subsystem", "bdev");
 	spdk_json_write_named_array_begin(w, "config");
+	/* Without enable_flush bdev_nvme completes a FLUSH unsent, so a host fsync would not reach
+	 * the drives' volatile write cache. */
+	json_method_begin(w, "bdev_nvme_set_options");
+	spdk_json_write_named_bool(w, "enable_flush", true);
+	json_method_end(w);
 	for (q = 0; q < g_iu_opts.num_peers; q++) {
 		if (g_host_fs_mask & (1U << q)) {
 			snprintf(name, sizeof(name), "%s%u", HOST_CTRLR_PREFIX, q);
