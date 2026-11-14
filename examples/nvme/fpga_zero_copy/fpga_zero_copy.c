@@ -24,6 +24,11 @@
 #define APP_NAME "fpga_zero_copy"
 /* bdev_nvme names drive q's controller <prefix><q> and its namespace bdev <prefix><q>n1. */
 #define HOST_CTRLR_PREFIX "fpga_nvme_host"
+#define HOST_RAID_NAME "fpga_raid0"
+/* Past every per-drive ublk id, so the stripe is never mistaken for one of its drives. */
+#define HOST_RAID_UBLK_ID IUVENTUS_MAX_PEERS
+/* One full Iuventus write per drive, the chunk the file shell maps logical LBAs with. */
+#define HOST_RAID_STRIP_KB 128
 /* Admin queues of the drives the library attached are polled at this period. */
 #define ADMIN_POLL_PERIOD_US 1000
 
@@ -43,6 +48,8 @@ static struct spdk_app_opts     g_app_opts;
 
 /* -U: drives (bit q = queue q's drive) whose namespace is also exposed to the host via ublk. */
 static uint32_t                 g_host_fs_mask = 0;
+/* -S: the -U drives form one RAID0 stripe, exposed instead of one device per drive. */
+static bool                     g_host_fs_raid = false;
 
 static struct iuventus_opts     g_iu_opts;
 static struct iuventus_ctx      g_iu_ctx;
@@ -283,10 +290,13 @@ usage(void)
 	printf("\t[-U peer mask: bit q exposes queue q's drive to the host as /dev/ublkb<q> through\n");
 	printf("\t     bdev_nvme, next to the card's queue pair (default 0 = none)]\n");
 	printf("\t     Requires kernel >= 6.0 with CONFIG_BLK_DEV_UBLK (modprobe ublk_drv).\n");
+	printf("\t[-S stripe the -U drives as one RAID0 (%u KiB strips) exposed as /dev/ublkb%u;\n",
+	       HOST_RAID_STRIP_KB, HOST_RAID_UBLK_ID);
+	printf("\t     -U must select drives 0..n-1 with n a power of two]\n");
 }
 
 /* Options this application owns; everything else belongs to the environment library. */
-#define APP_GETOPT_STRING "si:gm:L:rP:U:"
+#define APP_GETOPT_STRING "si:gm:L:rP:U:S"
 
 static int
 app_parse(int ch, char *arg)
@@ -300,6 +310,9 @@ app_parse(int ch, char *arg)
 		break;
 	case 'P':
 		g_prp_dump_path = arg;
+		break;
+	case 'S':
+		g_host_fs_raid = true;
 		break;
 	case 'U': {
 		char *end = NULL;
@@ -449,7 +462,8 @@ host_ns_bdev_name(char *name, size_t len, uint32_t q)
 	snprintf(name, len, "%s%un1", HOST_CTRLR_PREFIX, q);
 }
 
-/* JSON config that attaches every -U drive through bdev_nvme and exports its namespace via ublk. */
+/* JSON config that attaches every -U drive through bdev_nvme and exports its namespace, or with -S
+ * their RAID0 stripe, via ublk. */
 static char *
 host_fs_config(void)
 {
@@ -483,6 +497,22 @@ host_fs_config(void)
 			json_method_end(w);
 		}
 	}
+	if (g_host_fs_raid) {
+		json_method_begin(w, "bdev_raid_create");
+		spdk_json_write_named_string(w, "name", HOST_RAID_NAME);
+		spdk_json_write_named_string(w, "raid_level", "raid0");
+		spdk_json_write_named_uint32(w, "strip_size_kb", HOST_RAID_STRIP_KB);
+		/* Queue order, so stripe drive d is queue d as the file shell's mapping assumes. */
+		spdk_json_write_named_array_begin(w, "base_bdevs");
+		for (q = 0; q < g_iu_opts.num_peers; q++) {
+			if (g_host_fs_mask & (1U << q)) {
+				host_ns_bdev_name(name, sizeof(name), q);
+				spdk_json_write_string(w, name);
+			}
+		}
+		spdk_json_write_array_end(w);
+		json_method_end(w);
+	}
 	spdk_json_write_array_end(w);
 	spdk_json_write_object_end(w);
 
@@ -492,13 +522,20 @@ host_fs_config(void)
 	json_method_begin(w, "ublk_create_target");
 	spdk_json_write_named_string(w, "cpumask", "0x1");
 	json_method_end(w);
-	for (q = 0; q < g_iu_opts.num_peers; q++) {
-		if (g_host_fs_mask & (1U << q)) {
-			host_ns_bdev_name(name, sizeof(name), q);
-			json_method_begin(w, "ublk_start_disk");
-			spdk_json_write_named_string(w, "bdev_name", name);
-			spdk_json_write_named_uint32(w, "ublk_id", q);
-			json_method_end(w);
+	if (g_host_fs_raid) {
+		json_method_begin(w, "ublk_start_disk");
+		spdk_json_write_named_string(w, "bdev_name", HOST_RAID_NAME);
+		spdk_json_write_named_uint32(w, "ublk_id", HOST_RAID_UBLK_ID);
+		json_method_end(w);
+	} else {
+		for (q = 0; q < g_iu_opts.num_peers; q++) {
+			if (g_host_fs_mask & (1U << q)) {
+				host_ns_bdev_name(name, sizeof(name), q);
+				json_method_begin(w, "ublk_start_disk");
+				spdk_json_write_named_string(w, "bdev_name", name);
+				spdk_json_write_named_uint32(w, "ublk_id", q);
+				json_method_end(w);
+			}
 		}
 	}
 	spdk_json_write_array_end(w);
@@ -626,8 +663,14 @@ fzc_start(void *arg)
 			spdk_app_stop(-ENODEV);
 			return;
 		}
-		printf("Host filesystem bdev %s%un1 registered as: /dev/ublkb%u\n",
-		       HOST_CTRLR_PREFIX, i, i);
+		if (!g_host_fs_raid) {
+			printf("Host filesystem bdev %s%un1 registered as: /dev/ublkb%u\n",
+			       HOST_CTRLR_PREFIX, i, i);
+		}
+	}
+	if (g_host_fs_raid) {
+		printf("Host filesystem RAID0 %s over %u drives registered as: /dev/ublkb%u\n",
+		       HOST_RAID_NAME, (unsigned)__builtin_popcount(g_host_fs_mask), HOST_RAID_UBLK_ID);
 	}
 
 	if (g_do_ctrl_rst || g_do_subs_rst) {
@@ -701,6 +744,12 @@ main(int argc, char **argv)
 	if (g_host_fs_mask >> g_iu_opts.num_peers) {
 		fprintf(stderr, "-U 0x%x names a drive past the %u given with -t\n",
 			g_host_fs_mask, g_iu_opts.num_peers);
+		return EXIT_FAILURE;
+	}
+	/* mask + 1 is a power of two only when the mask selects drives 0..n-1. */
+	if (g_host_fs_raid && (g_host_fs_mask == 0 || (g_host_fs_mask & (g_host_fs_mask + 1)) != 0 ||
+			       !spdk_u32_is_pow2((uint32_t)__builtin_popcount(g_host_fs_mask)))) {
+		fprintf(stderr, "-S needs -U to select drives 0..n-1 with n a power of two\n");
 		return EXIT_FAILURE;
 	}
 	if (g_host_fs_mask != 0 && (g_do_ctrl_rst || g_do_subs_rst)) {
