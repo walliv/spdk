@@ -442,6 +442,13 @@ json_method_end(struct spdk_json_write_ctx *w)
 	spdk_json_write_object_end(w);
 }
 
+/* Namespace bdev that bdev_nvme registers for drive q. */
+static void
+host_ns_bdev_name(char *name, size_t len, uint32_t q)
+{
+	snprintf(name, len, "%s%un1", HOST_CTRLR_PREFIX, q);
+}
+
 /* JSON config that attaches every -U drive through bdev_nvme and exports its namespace via ublk. */
 static char *
 host_fs_config(void)
@@ -487,7 +494,7 @@ host_fs_config(void)
 	json_method_end(w);
 	for (q = 0; q < g_iu_opts.num_peers; q++) {
 		if (g_host_fs_mask & (1U << q)) {
-			snprintf(name, sizeof(name), "%s%un1", HOST_CTRLR_PREFIX, q);
+			host_ns_bdev_name(name, sizeof(name), q);
 			json_method_begin(w, "ublk_start_disk");
 			spdk_json_write_named_string(w, "bdev_name", name);
 			spdk_json_write_named_uint32(w, "ublk_id", q);
@@ -519,7 +526,7 @@ host_fs_ctrlr(uint32_t q)
 	struct spdk_nvme_ns *ns = NULL;
 	char name[32];
 
-	snprintf(name, sizeof(name), "%s%un1", HOST_CTRLR_PREFIX, q);
+	host_ns_bdev_name(name, sizeof(name), q);
 	if (spdk_bdev_open_ext(name, false, host_bdev_event_cb, NULL, &desc) != 0) {
 		return NULL;
 	}
